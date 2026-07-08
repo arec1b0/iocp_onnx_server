@@ -1,0 +1,12 @@
+[project]
+name = "iocp-onnx-server"
+version = "0.1.0"
+description = "Python tooling for the IOCP ONNX inference server: dummy model export, test clients, and metrics analysis"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "matplotlib>=3.11.0",
+    "onnx>=1.22.0",
+    "onnxscript>=0.7.1",
+    "torch>=2.13.0",
+]
