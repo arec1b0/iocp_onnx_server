@@ -11,15 +11,20 @@ link_libraries(ws2_32 mswsock)
 set(ONNXRUNTIME_DIR "C:/onnxruntime")
 include_directories(src ${ONNXRUNTIME_DIR}/include)
 
-set(SOURCES
-    src/main.cpp
+set(IOCP_SOURCES
     src/server/IocpServer.cpp
     src/server/Connection.cpp
+    src/server/Protocol.cpp
+    src/utils/Logger.cpp
+    src/utils/Metrics.cpp
+)
+
+set(SOURCES
+    src/main.cpp
+    ${IOCP_SOURCES}
     src/inference/OnnxModel.cpp
     src/inference/TensorUtils.cpp
-    src/utils/Logger.cpp
     src/utils/Config.cpp
-    src/utils/Metrics.cpp
 )
 
 add_executable(${PROJECT_NAME} ${SOURCES})
@@ -34,3 +39,34 @@ foreach(DLL_FILE ${ORT_DLLS})
         $<TARGET_FILE_DIR:${PROJECT_NAME}>
     )
 endforeach()
+
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(protocol_tests
+        tests/ProtocolTests.cpp
+        src/server/Connection.cpp
+        src/server/Protocol.cpp
+        src/inference/TensorUtils.cpp
+    )
+    add_executable(send_completion_tests
+        tests/SendCompletionTests.cpp
+        src/server/Connection.cpp
+        src/server/Protocol.cpp
+    )
+    add_executable(iocp_lifecycle_tests
+        tests/IocpLifecycleTests.cpp
+        ${IOCP_SOURCES}
+    )
+    add_executable(buffered_pipelining_tests
+        tests/BufferedPipeliningTests.cpp
+        ${IOCP_SOURCES}
+    )
+    set_target_properties(protocol_tests send_completion_tests iocp_lifecycle_tests buffered_pipelining_tests
+        PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests"
+    )
+    add_test(NAME protocol_framing COMMAND protocol_tests)
+    add_test(NAME send_completion_state COMMAND send_completion_tests)
+    add_test(NAME buffered_pipelining_state COMMAND buffered_pipelining_tests)
+    add_test(NAME iocp_lifecycle COMMAND iocp_lifecycle_tests)
+    set_tests_properties(iocp_lifecycle PROPERTIES LABELS network TIMEOUT 90)
+endif()

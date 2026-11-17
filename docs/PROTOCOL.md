@@ -18,6 +18,12 @@ The server speaks a minimal length-prefixed binary protocol over raw TCP. There 
 
 `element_count` must equal the total element count of the model's input tensor — the product of all input-shape dimensions after dynamic dims are pinned to 1 (for the bundled dummy model with shape `[1, 10]`: **10**).
 
+The server caps each input and output payload at 16 MiB by default. Set
+`IOCP_ONNX_MAX_PAYLOAD_BYTES` to a decimal integer from 4 through 4294967287 (up
+to ten digits) before starting the server to change the limit. The 8-byte
+prefix is excluded. Startup fails if the override is invalid or either model
+tensor exceeds the configured limit.
+
 ## Response
 
 Identical layout:
@@ -31,9 +37,18 @@ Identical layout:
 
 `element_count` is the product of the model's output-shape dimensions. Exactly one response is sent per complete request, in request order.
 
+Clients can send consecutive requests on the same connection before reading
+responses. The server sends one response at a time and checks for the next
+buffered request after each full send completion.
+
 ### Error signaling
 
-There are no status codes. If inference fails — including an `element_count` that doesn't match the model's input size — the server responds with `element_count = 0` and an empty payload. Clients should treat a zero-length response as an error.
+There are no status codes. A prefix whose count differs from the model's
+input count closes the connection as soon as the complete prefix arrives.
+The server discards any incomplete frame when the peer disconnects. If
+inference fails after receiving a valid frame, the server sends
+`element_count = 0` with an empty payload. Clients should treat a zero-length
+response as an inference error.
 
 ## Client requirements
 

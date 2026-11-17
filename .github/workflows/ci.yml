@@ -2,9 +2,9 @@ name: Windows C++ CI
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "master" ]
   pull_request:
-    branches: [ "main" ]
+    branches: [ "master" ]
 
 jobs:
   build:
@@ -17,21 +17,31 @@ jobs:
     - name: Setup ONNX Runtime
       shell: pwsh
       run: |
-        $url = "https://github.com/microsoft/onnxruntime/releases/download/v1.17.1/onnxruntime-win-x64-1.17.1.zip"
-        Write-Host "[INFO] Downloading ONNX Runtime 1.17.1..."
+        # The bundled test model uses ONNX IR 10, supported starting in ORT 1.18.
+        $version = "1.18.1"
+        $package = "onnxruntime-win-x64-$version"
+        $url = "https://github.com/microsoft/onnxruntime/releases/download/v$version/$package.zip"
+        Write-Host "[INFO] Downloading ONNX Runtime $version..."
         Invoke-WebRequest -Uri $url -OutFile "ort.zip"
         
         Write-Host "[INFO] Extracting..."
         Expand-Archive -Path "ort.zip" -DestinationPath "C:\"
         
         Write-Host "[INFO] Renaming directory to match CMake configuration..."
-        Rename-Item -Path "C:\onnxruntime-win-x64-1.17.1" -NewName "C:\onnxruntime"
+        Rename-Item -Path "C:\$package" -NewName "onnxruntime"
 
     - name: Configure CMake
       run: cmake -B build -G "Visual Studio 17 2022" -A x64 -DCMAKE_BUILD_TYPE=Release
 
     - name: Build Project
       run: cmake --build build --config Release
+
+    - name: Test Protocol Framing
+      run: ctest --test-dir build -C Release --output-on-failure
+
+    - name: Test TCP Protocol
+      shell: pwsh
+      run: ./tests/ProtocolSmoke.ps1 -ServerExe build/Release/iocp_onnx_server.exe
 
     - name: Upload Build Artifacts
       uses: actions/upload-artifact@v4

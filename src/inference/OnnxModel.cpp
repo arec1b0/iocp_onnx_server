@@ -7,7 +7,7 @@ OnnxModel::OnnxModel()
       session(nullptr),
       memoryInfo(Ort::MemoryInfo::CreateCpu(OrtDeviceAllocator, OrtMemTypeCPU)) {}
 
-bool OnnxModel::Load(const std::string& modelPath) {
+bool OnnxModel::Load(const std::string& modelPath, std::size_t maxTensorElements) {
     try {
         Ort::SessionOptions sessionOptions;
         sessionOptions.SetIntraOpNumThreads(1);
@@ -54,6 +54,15 @@ bool OnnxModel::Load(const std::string& modelPath) {
             }
         }
 
+        const auto inputCount = TensorUtils::GetTensorElementsCount(inputShape, maxTensorElements);
+        const auto outputCount = TensorUtils::GetTensorElementsCount(outputShape, maxTensorElements);
+        if (!inputCount || !outputCount) {
+            LOG_ERR("Model input or output exceeds IOCP_ONNX_MAX_PAYLOAD_BYTES.");
+            return false;
+        }
+        inputElementCount_ = *inputCount;
+        outputElementCount_ = *outputCount;
+
         LOG_INFO("Model loaded successfully from: " + modelPath);
         return true;
     }
@@ -66,14 +75,12 @@ bool OnnxModel::Load(const std::string& modelPath) {
 std::vector<float> OnnxModel::RunInference(const std::vector<float>& inputData) {
     std::vector<float> outputData;
     try {
-        size_t inputElementCount = TensorUtils::GetTensorElementsCount(inputShape);
-        if (inputData.size() != inputElementCount) {
-            LOG_ERR("Input data size mismatch. Expected: " + std::to_string(inputElementCount) + ", Got: " + std::to_string(inputData.size()));
+        if (inputData.size() != inputElementCount_) {
+            LOG_ERR("Input data size mismatch. Expected: " + std::to_string(inputElementCount_) + ", Got: " + std::to_string(inputData.size()));
             return outputData;
         }
 
-        size_t outputElementCount = TensorUtils::GetTensorElementsCount(outputShape);
-        outputData.resize(outputElementCount);
+        outputData.resize(outputElementCount_);
 
         // Bind raw continuous memory directly to prevent extra tensor allocation overhead
         Ort::Value inputTensor = Ort::Value::CreateTensor<float>(

@@ -8,10 +8,10 @@ This document describes the internal design of the IOCP ONNX Inference Server: i
 |-----------|-------|----------------|
 | Entry point | [src/main.cpp](../src/main.cpp) | Loads config and model, starts/stops the server, handles `SIGINT`/`SIGTERM` |
 | Server core | [src/server/IocpServer.{h,cpp}](../src/server/IocpServer.cpp) | Listening socket, accept loop, completion port, worker pool, request state machine |
-| Connection state | [src/server/Connection.{h,cpp}](../src/server/Connection.cpp) | Per-client socket, read/write I/O contexts, receive accumulation buffer |
+| Connection state | [src/server/Connection.{h,cpp}](../src/server/Connection.cpp) | Per-client socket, read/write I/O contexts, and request framer |
 | Inference | [src/inference/OnnxModel.{h,cpp}](../src/inference/OnnxModel.cpp) | ONNX Runtime session, model metadata, zero-copy `Run()` |
 | Tensor helpers | [src/inference/TensorUtils.{h,cpp}](../src/inference/TensorUtils.cpp) | Element-count computation from a tensor shape |
-| Config | [src/utils/Config.{h,cpp}](../src/utils/Config.cpp) | Compile-time defaults (model path, bind address, worker count) |
+| Config | [src/utils/Config.{h,cpp}](../src/utils/Config.cpp) | Server defaults and environment override for the payload limit |
 | Logging | [src/utils/Logger.{h,cpp}](../src/utils/Logger.cpp) | Thread-safe timestamped logging to stdout/stderr |
 | Metrics | [src/utils/Metrics.{h,cpp}](../src/utils/Metrics.cpp) | Singleton JSONL sink for per-inference statistics |
 
@@ -20,75 +20,68 @@ This document describes the internal design of the IOCP ONNX Inference Server: i
 The server runs **1 + N + 1** threads:
 
 - **Main thread** — after startup, sleeps in a 100 ms polling loop until a termination signal flips the global `g_Running` flag, then calls `IocpServer::Stop()`.
-- **Accept thread** (1) — blocks in `WSAAccept` on the listening socket. For each new client it allocates a `Connection`, associates the client socket with the completion port (using the `Connection*` as the completion key), and posts the first overlapped `WSARecv`.
-- **Worker threads** (N = `Config::workerThreads`, default `std::thread::hardware_concurrency()`) — each blocks in `GetQueuedCompletionStatus(INFINITE)` and services I/O completions. **Inference runs directly on these threads**; there is no separate inference queue.
+- **Accept thread** (1) — waits for readiness on the nonblocking listener with a finite `select` timeout. It associates accepted sockets with the completion port before admitting them and posting the first read.
+- **Worker threads** (N = `Config::workerThreads`, default `std::thread::hardware_concurrency()`) — service I/O completions with `GetQueuedCompletionStatus`. A finite wait lets idle workers observe shutdown after the registry drains. Inference runs directly on these threads outside the connection registry lock.
 
 Because inference happens on the worker thread that dequeued the completion, ONNX Runtime's intra-op parallelism is deliberately set to 1 (`SetIntraOpNumThreads(1)`) — parallelism comes from concurrent requests across workers rather than from parallelizing a single inference.
 
+### Ownership invariants
+
+- The connection registry uniquely owns each admitted connection. The completion key is a borrowed `Connection*`; the registry keeps it and its two I/O contexts alive while a completion can still refer to them.
+- Each entry reserves at most one pending operation. The registry lock serializes posting, socket closure, and completion accounting. An immediate posting failure clears the reservation because Winsock will issue no packet for that attempt.
+- A worker claims a dequeued completion under the lock and holds exclusive access to the connection's protocol state until it posts the next operation or retires the entry. Shutdown can close that socket while the handler runs, including during inference. The registry holds the connection until that handler returns.
+- The listener belongs to the accept thread while it runs. The lifecycle mutex serializes `Start()` and `Stop()`, and socket and port teardown follow the thread joins.
+
 ### Shutdown sequence
 
-`IocpServer::Stop()`:
+1. Publish the stop request under the registry lock. From that point admission and new I/O are closed.
+2. Join the accept thread and close the listener. Both the readiness wait and accept call have bounded waits.
+3. Close all active sockets to initiate cancellation. Workers account for successful, failed, and canceled completions, and return any entries they hold while processing.
+4. Wait for the registry to empty. Idle workers then exit, and the lifecycle caller joins them before closing the completion port and releasing its Winsock reference.
 
-1. Clears `isRunning_` and closes the listening socket — this unblocks `WSAAccept` with an error, letting the accept thread exit its loop.
-2. Posts N sentinel completion packets (`PostQueuedCompletionStatus(iocp, 0, 0, NULL)`); each worker recognizes the all-zero packet and breaks out of its loop.
-3. Joins the accept thread and all workers, closes the completion port, and calls `WSACleanup()`.
-
-Live client connections are not individually torn down at shutdown; the process exit releases them.
+Partial startup failures unwind through the same teardown. Repeated and concurrent `Stop()` calls serialize through the lifecycle mutex. Shutdown closes inference clients promptly and waits for any inference already in progress to return.
 
 ## Connection Lifecycle
 
 ```
-WSAAccept
-   │
-   ▼
-new Connection ── CreateIoCompletionPort(socket, iocp, key = Connection*)
-   │
-   ▼
-WSARecv (overlapped) ◄────────────────────────────┐
-   │                                              │
-   ▼  completion (Read)                           │
-append to rxBuffer                                │
-   │                                              │
-   ▼                                              │
-state machine:                                    │
-  ReadHeader  ── 8 bytes available? ── no ──► re-arm WSARecv
-  ReadPayload ── count*4 bytes available? ─ no ─► re-arm WSARecv
-   │ yes                                          │
-   ▼                                              │
-RunInference ──► Metrics::RecordInference         │
-   │                                              │
-   ▼                                              │
-WSASend (overlapped)                              │
-   │                                              │
-   ▼  completion (Write)                          │
-re-arm WSARecv ───────────────────────────────────┘
+WSAAccept → register Connection → post WSARecv
+Read completion → append received bytes → inspect buffered stream
+Final write completion ─────────────────→ inspect buffered stream
 
-(any failed/zero-byte completion ──► delete Connection ──► closesocket)
+Inspect buffered stream
+  complete frame → run inference → post WSASend
+  incomplete frame → post WSARecv
+  invalid prefix → retire registry entry
+
+Write completion
+  short → repost unsent suffix
+  full → inspect buffered stream
+
+Failed or zero-byte completion → retire registry entry
 ```
 
 Key points:
 
-- Each `Connection` owns two fixed `IOContext` objects (one for reads, one for writes), each embedding a `WSAOVERLAPPED` as its **first member** so the `LPOVERLAPPED` returned by `GetQueuedCompletionStatus` can be cast back to the `IOContext`. The `Connection*` itself travels as the completion key.
-- I/O buffers are 64 KiB per context; the receive accumulation buffer (`rxBuffer`) reserves 128 KiB.
-- At most **one overlapped operation is outstanding per connection at a time**: a read is only re-armed after a request is either incomplete (need more bytes) or fully answered (write completion arrives). This keeps the state machine single-threaded per connection without locks.
-- Connection teardown is driven by completion status: a failed `GetQueuedCompletionStatus` result or a zero-byte transfer (peer closed) deletes the `Connection`, whose destructor closes the socket.
+- Each `Connection` owns a read and a write `IOContext`, each with a `WSAOVERLAPPED`. The registry matches the returned address against the pending context for the connection in the completion key.
+- The read buffer is fixed at 64 KiB. A cursor retains bytes after the current frame. Posting a receive compacts any incomplete header to the start of the buffer. The framer accumulates only bytes of a single validated payload.
+- At most **one overlapped operation is outstanding per connection at a time**. A short write completion advances the confirmed byte count and reposts the unsent suffix using the same response buffer. The final write completion lets the worker inspect the next frame. This serializes request processing and responses across workers.
+- The worker retires the entry after accounting for a terminal completion. A socket closed by shutdown stays registered until its pending operation or active handler is accounted for.
 
 ## Request State Machine
 
-The wire protocol ([PROTOCOL.md](PROTOCOL.md)) is a length-prefixed float array. Because TCP is a byte stream, a request may arrive fragmented across many completions, or several requests may arrive in a single completion. The worker handles both with a per-connection state machine over `rxBuffer`:
+The wire protocol ([PROTOCOL.md](PROTOCOL.md)) is a length-prefixed float array. A request may arrive fragmented across many completions, and a completion can contain bytes from more than one request. The per-connection framer processes one request at a time.
 
-1. **`ReadHeader`** — wait until ≥ 8 bytes are buffered, then consume the little-endian `uint64` element count and switch to `ReadPayload`.
-2. **`ReadPayload`** — wait until `element_count × 4` bytes are buffered, then copy them into a contiguous `std::vector<float>`, run inference, send the response, and switch back to `ReadHeader`.
+1. **Header.** Wait for eight bytes in the read buffer and decode the little-endian `uint64` count. Close the connection if it differs from the validated model input count.
+2. **Payload.** Accumulate fragments up to the model's input payload size. Once complete, assemble the `std::vector<float>`, run inference, and post the response. Retain trailing bytes by advancing the read cursor.
+3. **Response.** Finish the pending response before inspecting the retained bytes. A complete buffered request starts its response immediately. An incomplete frame re-arms the receive. A malformed subsequent prefix closes the connection.
 
-If the buffer doesn't yet hold a complete header or payload, the worker simply re-arms `WSARecv` and returns to the pool — no busy waiting.
-
-> Note: after a response is sent, processing of `rxBuffer` pauses until the write completion re-arms a read. Bytes of a subsequent pipelined request already sitting in `rxBuffer` are therefore processed only after the next read completion arrives (see Limitations).
+Each completion advances at most one request. The registry still owns the connection until its pending I/O or active handler is accounted for during disconnect and shutdown.
 
 ## Zero-Copy Inference
 
 `OnnxModel::RunInference` avoids ONNX Runtime-managed tensor allocations:
 
-- The input `std::vector<float>` (assembled from `rxBuffer`) is wrapped in-place with `Ort::Value::CreateTensor<float>` over CPU memory.
+- The input `std::vector<float>` assembled by the framer is wrapped in-place with `Ort::Value::CreateTensor<float>` over CPU memory.
 - The output `std::vector<float>` is pre-sized from the model's static output shape and likewise bound in-place, so `session.Run()` writes results directly into the buffer that is then memcpy'd into the send context.
 
 Model metadata is read once at load time (`OnnxModel::Load`):
@@ -97,7 +90,7 @@ Model metadata is read once at load time (`OnnxModel::Load`):
 - Dynamic dimensions (reported as `-1`) are pinned to `1`, effectively fixing batch size to 1.
 - Graph optimization level is `ORT_ENABLE_ALL`.
 
-A request whose element count doesn't match the model's expected input size is rejected inside `RunInference` (logged, returns an empty vector); the server still sends a response with `element_count = 0`.
+Model loading computes both element counts with checked multiplication and verifies that both payloads fit the configured limit. The input count is used to validate each request before payload accumulation begins.
 
 ## Observability
 
@@ -116,12 +109,6 @@ The intent is lightweight **model/data drift detection** without external depend
 
 Deliberate simplifications to keep the codebase compact. Roughly in order of importance if the server were to face untrusted traffic:
 
-1. **Unvalidated header** — `expectedElements` comes straight off the wire with no upper bound; a hostile 8-byte header can trigger a multi-gigabyte allocation attempt. A sanity cap (e.g. reject counts above the model's input size) is the first thing to add.
-2. **Partial sends unhandled** — the code assumes `WSASend` eventually transmits the whole buffer in one overlapped operation; a short write would corrupt the response stream for that client.
-3. **Pipelining latency** — a complete second request already in `rxBuffer` isn't processed until another read completion fires (the post-write path re-arms a read instead of re-running the state machine).
-4. **`isRunning_` is a plain `bool`** shared across threads (benign in practice for shutdown signaling, but formally a data race; `std::atomic<bool>` would be correct).
-5. **`rxBuffer` front-erase is O(n)** — fine at these message sizes; a ring buffer or read offset would remove the cost.
-6. **Error-path cleanup** — `delete conn` on I/O failure relies on no other operation being outstanding for that connection; the single-outstanding-op invariant makes this safe today but fragile under modification.
-7. **Fixed configuration** — address, port, model path, and worker count are compiled in; there are no CLI flags, env vars, or config file.
-8. **Single model, single node, `float32` only** — no multi-model routing, no non-float dtypes, batch pinned to 1.
-9. **`size_t` in the protocol spec** — the wire format is de facto `uint64` little-endian (x64 Windows); clients on other ABIs must not use their native `size_t`.
+1. **Shutdown waits for current inference.** Socket closure cancels network I/O. A running model call must return before its worker can exit.
+2. **Fixed listener and model settings.** Address, port, model path, and worker count are compiled in.
+3. **Single model, single node, `float32` only.** Dynamic dimensions are pinned to 1.

@@ -2,19 +2,13 @@
 #include <winsock2.h>
 #include <windows.h>
 #include <vector>
+#include "Protocol.h"
+#include "SocketHandle.h"
 
 /// Direction of an overlapped socket operation, used to dispatch completions.
 enum class IOOperation { Read, Write };
 
-/// Position in the request state machine: waiting for the 8-byte length
-/// prefix, or accumulating the float payload it announced.
-enum class ClientState { ReadHeader, ReadPayload };
-
 /// Context for a single overlapped WinSock operation.
-///
-/// `overlapped` must remain the first member: workers cast the LPOVERLAPPED
-/// returned by GetQueuedCompletionStatus back to an IOContext* to recover the
-/// operation type and buffer.
 struct IOContext {
     WSAOVERLAPPED overlapped;
     IOOperation operation;
@@ -30,35 +24,46 @@ struct IOContext {
     void Reset();
 };
 
+struct SendCompletion {
+    bool succeeded;
+    // Present when a successful completion leaves bytes to send.
+    IOContext* remaining;
+};
+
 /// Per-client connection state.
 ///
-/// Owns the socket, one read and one write IOContext (at most one overlapped
-/// operation is outstanding at a time), and the receive accumulation buffer
-/// used to reassemble requests fragmented across TCP segments. A Connection*
-/// is registered as the IOCP completion key for its socket; workers delete it
-/// on I/O failure or peer disconnect, which closes the socket.
+/// Owns the socket, both I/O contexts, and the request framer. The server
+/// registry keeps the connection alive from admission through final completion.
 class Connection {
 public:
-    Connection(SOCKET socket);
-    ~Connection();
+    Connection(SocketHandle socket, std::size_t expectedPayloadBytes);
+    Connection(Connection&&) = delete;
+    Connection& operator=(Connection&&) = delete;
 
     SOCKET GetSocket() const;
-    IOContext* GetReadContext();
-    IOContext* GetWriteContext();
+    IOContext* PrepareRead();
+    Protocol::ReadResult ReadRequest(std::size_t bytesReceived, std::vector<float>& input);
+    Protocol::ReadResult ReadBufferedRequest(std::vector<float>& input);
 
-    /// Closes the underlying socket (idempotent). Also called by the destructor.
+    /// Encodes a response and prepares its first send. Rejects a new response
+    /// while a previous response is in progress.
+    IOContext* PrepareResponse(std::span<const float> output);
+    /// Called only after dequeuing the write completion. On failure the caller
+    /// closes the connection. On success it posts the suffix or inspects the buffered stream.
+    SendCompletion CompleteSend(bool succeeded, std::size_t bytesTransferred);
+
+    /// Idempotent. The server serializes socket closure with I/O posting.
     void Close();
 
-    /// Current position in the header/payload state machine.
-    ClientState state;
-    /// Element count parsed from the last request header; valid in ReadPayload.
-    size_t expectedElements;
-    /// Accumulation buffer: bytes received so far but not yet consumed as a
-    /// complete header or payload.
-    std::vector<char> rxBuffer;
-
 private:
-    SOCKET socket_;
+    IOContext* PrepareSendSuffix();
+
+    SocketHandle socket_;
     IOContext readContext_;
     IOContext writeContext_;
+    Protocol::RequestFramer requestFramer_;
+    std::size_t readBegin_ = 0;
+    std::size_t readEnd_ = 0;
+    std::size_t sendTotalBytes_ = 0;
+    std::size_t sendTransferredBytes_ = 0;
 };

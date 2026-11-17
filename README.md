@@ -105,7 +105,7 @@ with socket.socket() as s:
 - Windows 10/11, x64
 - Visual Studio 2022 (MSVC toolchain, "Desktop development with C++")
 - CMake ≥ 3.20
-- [ONNX Runtime](https://github.com/microsoft/onnxruntime/releases) v1.17.1 (win-x64), extracted to `C:/onnxruntime` (so that `C:/onnxruntime/include` and `C:/onnxruntime/lib` exist)
+- [ONNX Runtime](https://github.com/microsoft/onnxruntime/releases) v1.18.1 or newer (win-x64), extracted to `C:/onnxruntime` (so that `C:/onnxruntime/include` and `C:/onnxruntime/lib` exist)
 - Python ≥ 3.13 with [uv](https://docs.astral.sh/uv/) (only for the helper scripts)
 
 ### Build & Run
@@ -128,7 +128,7 @@ To serve your own model, place it at `models/model.onnx`. The server uses the mo
 
 ### Configuration
 
-Configuration is currently compiled-in via [Config.cpp](src/utils/Config.cpp):
+Defaults are defined in [Config.cpp](src/utils/Config.cpp).
 
 | Setting        | Default              | Description                                  |
 |----------------|----------------------|----------------------------------------------|
@@ -136,10 +136,21 @@ Configuration is currently compiled-in via [Config.cpp](src/utils/Config.cpp):
 | `ipAddress`    | `0.0.0.0`            | Listen address                               |
 | `port`         | `8080`               | Listen port                                  |
 | `workerThreads`| `hardware_concurrency` (fallback 2) | IOCP worker pool size          |
+| `IOCP_ONNX_MAX_PAYLOAD_BYTES` | `16777216` | Environment override for the maximum input and output payload size |
 
 ### Testing
 
-With the server running:
+Run the automated tests from the repository root after a Release build.
+The IOCP lifecycle test uses OS-assigned loopback ports. The TCP smoke test
+checks fragmented and pipelined requests against the inference server and
+requires port 8080 to be available.
+
+```powershell
+ctest --test-dir build -C Release --output-on-failure
+./tests/ProtocolSmoke.ps1 -ServerExe build/Release/iocp_onnx_server.exe
+```
+
+With the server running, the Python clients can also exercise inference.
 
 ```bat
 :: Single-request smoke test (sends 10 floats, expects each doubled)
@@ -168,17 +179,16 @@ Every inference appends one JSON line to `metrics.jsonl` in the working director
 
 ## CI
 
-[.github/workflows/ci.yml](.github/workflows/ci.yml) runs on pushes/PRs to `main`: it provisions ONNX Runtime 1.17.1 on a `windows-2022` runner, builds the Release configuration with CMake/MSVC, and uploads `build/Release/` as a workflow artifact.
+The [Windows CI workflow](.github/workflows/ci.yml) runs on pushes and pull
+requests to `master`. It provisions ONNX Runtime 1.18.1, builds with
+CMake/MSVC, runs the protocol and IOCP lifecycle tests, and uploads the Release build.
 
 ## Known Limitations
 
 This is a compact educational/prototyping server, not a hardened production gateway. The most important caveats (detailed in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)):
 
-- The wire header is an unvalidated 64-bit count — a malicious client can request an enormous allocation. Add a sanity cap before exposing to untrusted networks.
 - One inference per completion: requests execute directly on IOCP worker threads (intra-op parallelism is set to 1), so throughput scales with worker count, and a slow model blocks its worker.
-- Partial `WSASend` completions and multi-request pipelining edge cases are not fully handled.
 - Only the model's first input/output node is served; all tensors are `float32`.
-- Configuration is compile-time only (no CLI flags or config file yet).
 
 ## License
 

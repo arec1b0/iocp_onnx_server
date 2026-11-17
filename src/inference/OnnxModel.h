@@ -1,4 +1,5 @@
 #pragma once
+#include <cstddef>
 #include <string>
 #include <vector>
 #include <onnxruntime_cxx_api.h>
@@ -22,8 +23,11 @@ public:
     /// Creates the session and caches input/output names and shapes.
     /// @param modelPath  Path to the .onnx file (narrow string; converted to
     ///                   wide for the Windows ORT API).
+    /// @param maxTensorElements Maximum element count of either wire tensor.
     /// @return false if the model could not be loaded (logged).
-    bool Load(const std::string& modelPath);
+    bool Load(const std::string& modelPath, std::size_t maxTensorElements);
+
+    std::size_t InputElementCount() const { return inputElementCount_; }
 
     /// Runs one inference, binding the input and a pre-sized output buffer
     /// directly as ORT tensors (no ORT-managed allocations on the hot path).
@@ -40,6 +44,8 @@ private:
 
     std::vector<int64_t> inputShape;   ///< First input's shape, dynamic dims pinned to 1.
     std::vector<int64_t> outputShape;  ///< First output's shape, dynamic dims pinned to 1.
+    std::size_t inputElementCount_ = 0;
+    std::size_t outputElementCount_ = 0;
 
     std::string inputName;
     std::string outputName;
