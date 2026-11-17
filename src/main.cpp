@@ -20,8 +20,6 @@ int main() {
 
     const auto config = Config::Load();
     if (!config) {
-        LOG_ERR("IOCP_ONNX_MAX_PAYLOAD_BYTES must be a decimal integer from " +
-                std::to_string(Protocol::FloatBytes) + " to " + std::to_string(Protocol::MaxPayloadBytes) + ".");
         return 1;
     }
     
@@ -34,7 +32,8 @@ int main() {
 
     LOG_INFO("Starting IOCP Server...");
     IocpServer server(config->ipAddress, config->port, config->workerThreads, model.InputElementCount(),
-                      [&model](const std::vector<float>& input) { return model.RunInference(input); });
+                      [&model](const std::vector<float>& input) { return model.RunInference(input); },
+                      config->connectionLimits);
     
     if (!server.Start()) {
         LOG_ERR("Failed to start server.");

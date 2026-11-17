@@ -5,8 +5,20 @@
 #include <cstring>
 #include <future>
 #include <iostream>
+#include <latch>
 #include <semaphore>
 #include <stdexcept>
+#include <string_view>
+
+namespace {
+    struct ManualClock {
+        std::atomic<int> ticks{0};
+
+        IocpServer::Clock::time_point Now() const {
+            return IocpServer::Clock::time_point(std::chrono::milliseconds(ticks.load()));
+        }
+    };
+}
 
 struct IocpServerTestAccess {
     struct Snapshot {
@@ -14,12 +26,29 @@ struct IocpServerTestAccess {
         std::size_t writes = 0;
         std::size_t handlers = 0;
         std::size_t closed = 0;
+        std::size_t frames = 0;
+        std::size_t readCapacity = 0;
 
         bool Empty() const { return reads == 0 && writes == 0 && handlers == 0; }
     };
 
     static Snapshot Inspect(IocpServer& server) {
         std::lock_guard lock(server.registryMutex_);
+        return InspectLocked(server);
+    }
+
+    static Snapshot SweepAt(IocpServer& server, ManualClock& clock, int ticks) {
+        std::lock_guard lock(server.registryMutex_);
+        clock.ticks.store(ticks);
+        server.CloseExpiredLocked(clock.Now());
+        return InspectLocked(server);
+    }
+
+    static void Admit(IocpServer& server, SocketHandle socket) {
+        server.Admit(std::move(socket));
+    }
+
+    static Snapshot InspectLocked(const IocpServer& server) {
         Snapshot snapshot;
         for (const auto& entry : server.connections_) {
             const auto& active = entry.second;
@@ -27,6 +56,8 @@ struct IocpServerTestAccess {
                 ++snapshot.handlers;
             } else if (active.pending->operation == IOOperation::Read) {
                 ++snapshot.reads;
+                snapshot.frames += active.receivingFrame;
+                snapshot.readCapacity += active.pending->wsaBuf.len;
             } else {
                 ++snapshot.writes;
             }
@@ -119,16 +150,25 @@ namespace {
 
     using Frame = std::array<char, Protocol::HeaderBytes + Protocol::FloatBytes>;
 
-    Frame SendRequest(SOCKET socket, float value) {
+    Frame MakeRequest(float value) {
         Frame frame{1};
         std::memcpy(frame.data() + Protocol::HeaderBytes, &value, sizeof(value));
-        const auto size = static_cast<int>(frame.size());
+        return frame;
+    }
+
+    void SendBytes(SOCKET socket, std::span<const char> bytes) {
+        const auto size = static_cast<int>(bytes.size());
         int offset = 0;
         while (offset < size) {
-            const int sent = send(socket, frame.data() + offset, size - offset, 0);
+            const int sent = send(socket, bytes.data() + offset, size - offset, 0);
             Check(sent > 0, "failed to send request");
             offset += sent;
         }
+    }
+
+    Frame SendRequest(SOCKET socket, float value) {
+        const auto frame = MakeRequest(value);
+        SendBytes(socket, frame);
         return frame;
     }
 
@@ -334,18 +374,237 @@ namespace {
         }
         std::cout << '\n';
     }
+
+    // Deadlines are advanced explicitly. Winsock still supplies real completion packets.
+    constexpr ConnectionLimits TestLimits{2, 100ms, 50ms, 1000ms};
+
+    void TestAdmissionAndRecovery() {
+        ManualClock clock;
+        IocpServer server("127.0.0.1", 0, 4, 1, Echo, TestLimits, [&] { return clock.Now(); });
+        Check(server.Start(), "admission test server could not start");
+        const int port = server.BoundPort();
+
+        auto unconnected = OpenSocket();
+        const SOCKET failedSocket = unconnected.Get();
+        Inspect::Admit(server, std::move(unconnected));
+        Check(Inspect::Inspect(server).Empty(), "immediate initial receive failure retained a slot");
+        int socketType = 0;
+        int length = sizeof(socketType);
+        Check(getsockopt(failedSocket, SOL_SOCKET, SO_TYPE, reinterpret_cast<char*>(&socketType), &length) == SOCKET_ERROR
+                  && WSAGetLastError() == WSAENOTSOCK, "failed admission retained its socket");
+
+        auto first = Connect(port);
+        WaitFor([&] { return Inspect::Inspect(server).reads == 1; }, "connection below capacity was not admitted");
+        auto second = Connect(port);
+        WaitFor([&] { return Inspect::Inspect(server).reads == 2; }, "connection at capacity was not admitted");
+
+        std::vector<std::future<void>> overload;
+        for (int i = 0; i < 12; ++i) {
+            overload.push_back(std::async(std::launch::async, [port] {
+                const auto excess = Connect(port);
+                CheckPeerClosed(excess.Get());
+            }));
+        }
+        for (auto& rejected : overload) {
+            rejected.get();
+        }
+        Check(Inspect::Inspect(server).reads == 2, "overload changed the two admitted slots");
+        first.Close();
+        WaitFor([&] { return Inspect::Inspect(server).reads == 1; }, "disconnect did not recover capacity");
+        auto replacement = Connect(port);
+        CheckResponse(replacement.Get(), SendRequest(replacement.Get(), 1.0f));
+        CheckResponse(second.Get(), SendRequest(second.Get(), 2.0f));
+        server.Stop();
+        Check(Inspect::Stopped(server), "saturation test server did not drain");
+        std::cout << "Admission below and at capacity, 12 simultaneous rejections, failed admission cleanup, and slot recovery passed.\n";
+    }
+
+    void TestIdleExpiry() {
+        ManualClock clock;
+        IocpServer server("127.0.0.1", 0, 2, 1, Echo, TestLimits, [&] { return clock.Now(); });
+        Check(server.Start(), "idle test server could not start");
+        const int port = server.BoundPort();
+        auto client = Connect(port);
+        WaitFor([&] { return Inspect::Inspect(server).reads == 1; }, "idle receive was not posted");
+        Check(Inspect::SweepAt(server, clock, 99).closed == 0, "idle receive expired before its deadline");
+        const auto expired = Inspect::SweepAt(server, clock, 100);
+        Check(expired.closed == 1 && expired.reads == 1, "expiration freed the pending receive before dequeue");
+        CheckPeerClosed(client.Get());
+        WaitFor([&] { return Inspect::Inspect(server).Empty(); }, "idle expiration did not retire the slot");
+        Check(Inspect::SweepAt(server, clock, 100).Empty(), "repeated timeout pass changed the drained registry");
+        auto replacement = Connect(port);
+        CheckResponse(replacement.Get(), SendRequest(replacement.Get(), 3.0f));
+        std::cout << "Idle equality boundary, pending receive cancellation, and single retirement passed.\n";
+    }
+
+    void TestFrameExpiry(std::size_t prefixBytes) {
+        ManualClock clock;
+        IocpServer server("127.0.0.1", 0, 2, 1, Echo, TestLimits, [&] { return clock.Now(); });
+        Check(server.Start(), "frame timeout test server could not start");
+        auto client = Connect(server.BoundPort());
+        WaitFor([&] { return Inspect::Inspect(server).reads == 1; }, "initial receive was not posted");
+        const auto readCapacity = Inspect::Inspect(server).readCapacity;
+        const auto retained = prefixBytes < Protocol::HeaderBytes ? prefixBytes : 0;
+        const auto frame = MakeRequest(4.0f);
+        clock.ticks.store(10);
+        SendBytes(client.Get(), std::span(frame).first(prefixBytes));
+        WaitFor([&] {
+            const auto state = Inspect::Inspect(server);
+            return state.frames == 1 && state.readCapacity == readCapacity - retained;
+        }, "partial frame did not enter the expected receive phase");
+        Check(Inspect::SweepAt(server, clock, 59).closed == 0, "partial frame expired before its deadline");
+        const auto expired = Inspect::SweepAt(server, clock, 60);
+        Check(expired.closed == 1 && expired.frames == 1, "partial frame timer did not cancel the pending read");
+        CheckPeerClosed(client.Get());
+        WaitFor([&] { return Inspect::Inspect(server).Empty(); }, "partial frame cancellation retained its slot");
+    }
+
+    void TestIncrementalFrame() {
+        ManualClock clock;
+        IocpServer server("127.0.0.1", 0, 2, 1, Echo, TestLimits, [&] { return clock.Now(); });
+        Check(server.Start(), "incremental frame test server could not start");
+        auto client = Connect(server.BoundPort());
+        WaitFor([&] { return Inspect::Inspect(server).reads == 1; }, "initial receive was not posted");
+        const auto readCapacity = Inspect::Inspect(server).readCapacity;
+        const auto frame = MakeRequest(5.0f);
+        const std::array ticks{5, 25, 54};
+        for (std::size_t i = 0; i < ticks.size(); ++i) {
+            clock.ticks.store(ticks[i]);
+            SendBytes(client.Get(), std::span(frame).subspan(i, 1));
+            WaitFor([&] {
+                const auto state = Inspect::Inspect(server);
+                return state.frames == 1 && state.readCapacity == readCapacity - i - 1;
+            }, "incremental byte was not observed");
+        }
+        Check(Inspect::SweepAt(server, clock, 55).closed == 1, "the last fragment extended the absolute deadline");
+        CheckPeerClosed(client.Get());
+        WaitFor([&] { return Inspect::Inspect(server).Empty(); }, "incremental frame cancellation retained its slot");
+        std::cout << "Incremental frame delivery kept its original deadline.\n";
+    }
+
+    void TestFrameCompletionBoundary(int lastFragmentAt) {
+        ManualClock clock;
+        IocpServer server("127.0.0.1", 0, 2, 1, Echo, TestLimits, [&] { return clock.Now(); });
+        Check(server.Start(), "fragment completion test server could not start");
+        auto client = Connect(server.BoundPort());
+        WaitFor([&] { return Inspect::Inspect(server).reads == 1; }, "initial receive was not posted");
+        const auto frame = MakeRequest(6.0f);
+        clock.ticks.store(10);
+        SendBytes(client.Get(), std::span(frame).first(5));
+        WaitFor([&] { return Inspect::Inspect(server).frames == 1; }, "partial request was not observed");
+        clock.ticks.store(lastFragmentAt);
+        SendBytes(client.Get(), std::span(frame).subspan(5));
+        if (lastFragmentAt < 60) {
+            CheckResponse(client.Get(), frame);
+        } else {
+            CheckPeerClosed(client.Get());
+            WaitFor([&] { return Inspect::Inspect(server).Empty(); }, "expired completion retained its slot");
+        }
+    }
+
+    void TestInferenceAndBufferedFrameTiming() {
+        ManualClock clock;
+        std::binary_semaphore entered(0);
+        std::binary_semaphore release(0);
+        IocpServer server("127.0.0.1", 0, 2, 1, [&](const std::vector<float>& input) {
+            if (input.front() == 7.0f) {
+                entered.release();
+                Check(release.try_acquire_for(10s), "inference timing test gate expired");
+            }
+            return input;
+        }, TestLimits, [&] { return clock.Now(); });
+        Check(server.Start(), "inference timing test server could not start");
+        auto client = Connect(server.BoundPort());
+        const auto first = MakeRequest(7.0f);
+        const auto second = MakeRequest(8.0f);
+        std::vector<char> batch(first.begin(), first.end());
+        batch.insert(batch.end(), second.begin(), second.begin() + 3);
+        SendBytes(client.Get(), batch);
+        Check(entered.try_acquire_for(4s), "inference did not start");
+        const auto handling = Inspect::SweepAt(server, clock, 150);
+        release.release();
+        Check(handling.handlers == 1 && handling.closed == 0, "inference spent the network idle budget");
+        CheckResponse(client.Get(), first);
+        WaitFor([&] { return Inspect::Inspect(server).frames == 1; }, "buffered partial request was not exposed");
+        clock.ticks.store(199);
+        SendBytes(client.Get(), std::span(second).subspan(3));
+        CheckResponse(client.Get(), second);
+        std::cout << "Inference and buffered partial request received independent network budgets.\n";
+    }
+
+    void TestSendExpiry() {
+        ManualClock clock;
+        IocpServer server("127.0.0.1", 0, 2, 1, LargeOutput, TestLimits, [&] { return clock.Now(); });
+        Check(server.Start(), "send timeout test server could not start");
+        auto client = ConnectBackpressuredClient(server);
+        SendRequest(client.Get(), 9.0f);
+        WaitFor([&] { return Inspect::Inspect(server).writes == 1; }, "backpressured send was not pending");
+        const auto expired = Inspect::SweepAt(server, clock, 100);
+        Check(expired.closed == 1 && expired.writes == 1, "send timeout did not retain the pending write");
+        CheckPeerClosed(client.Get(), Protocol::HeaderBytes + LargeOutputElements * Protocol::FloatBytes);
+        WaitFor([&] { return Inspect::Inspect(server).Empty(); }, "send cancellation retained its slot");
+        std::cout << "Stalled send timeout canceled and drained a real WSASend.\n";
+    }
+
+    void TestTimeoutRacingWithShutdown() {
+        ManualClock clock;
+        IocpServer server("127.0.0.1", 0, 2, 1, Echo, TestLimits, [&] { return clock.Now(); });
+        Check(server.Start(), "shutdown race test server could not start");
+        auto client = Connect(server.BoundPort());
+        WaitFor([&] { return Inspect::Inspect(server).reads == 1; }, "race test receive was not pending");
+        std::latch start(1);
+        std::jthread stop([&] { start.wait(); server.Stop(); });
+        start.count_down();
+        Inspect::SweepAt(server, clock, 100);
+        stop.join();
+        CheckPeerClosed(client.Get());
+        Check(Inspect::Stopped(server), "shutdown and timeout did not drain exactly once");
+        std::cout << "Timeout sweep racing with shutdown passed.\n";
+    }
+
+    void TestWallClockSweep() {
+        const ConnectionLimits limits{2, 750ms, 250ms, 10ms};
+        IocpServer server("127.0.0.1", 0, 2, 1, Echo, limits);
+        Check(server.Start(), "wall-clock test server could not start");
+        auto idle = Connect(server.BoundPort());
+        auto partial = Connect(server.BoundPort());
+        const auto frame = MakeRequest(10.0f);
+        SendBytes(partial.Get(), std::span(frame).first(9));
+        WaitFor([&] { return Inspect::Inspect(server).frames == 1; }, "wall-clock partial request was not observed");
+        CheckPeerClosed(partial.Get());
+        CheckPeerClosed(idle.Get());
+        WaitFor([&] { return Inspect::Inspect(server).Empty(); }, "automatic timeout sweep left connections registered");
+        auto valid = Connect(server.BoundPort());
+        CheckResponse(valid.Get(), SendRequest(valid.Get(), 11.0f));
+        std::cout << "Automatic loopback sweep closed idle and incomplete clients, then served a valid request.\n";
+    }
 }
 
-int main() {
+int main(int argc, char** argv) {
     try {
         {
             Winsock winsock;
-            TestReceiveDisconnect();
-            TestSendDisconnect();
-            TestCancelActiveIo();
-            TestConcurrentStopDuringInference();
-            TestPartialStartup();
-            TestConcurrentChurn();
+            if (argc == 2 && std::string_view(argv[1]) == "--connection-policies") {
+                TestAdmissionAndRecovery();
+                TestIdleExpiry();
+                TestFrameExpiry(3);
+                TestFrameExpiry(Protocol::HeaderBytes + 2);
+                TestIncrementalFrame();
+                TestFrameCompletionBoundary(59);
+                TestFrameCompletionBoundary(60);
+                std::cout << "Partial-header and partial-payload expiry, valid fragmentation, and late completion passed.\n";
+                TestInferenceAndBufferedFrameTiming();
+                TestSendExpiry();
+                TestTimeoutRacingWithShutdown();
+                TestWallClockSweep();
+            } else {
+                TestReceiveDisconnect();
+                TestSendDisconnect();
+                TestCancelActiveIo();
+                TestConcurrentStopDuringInference();
+                TestPartialStartup();
+                TestConcurrentChurn();
+            }
         }
         const SocketHandle afterCleanup(socket(AF_INET, SOCK_STREAM, IPPROTO_TCP));
         Check(afterCleanup.Get() == INVALID_SOCKET && WSAGetLastError() == WSANOTINITIALISED,

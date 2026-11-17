@@ -11,7 +11,7 @@ This document describes the internal design of the IOCP ONNX Inference Server: i
 | Connection state | [src/server/Connection.{h,cpp}](../src/server/Connection.cpp) | Per-client socket, read/write I/O contexts, and request framer |
 | Inference | [src/inference/OnnxModel.{h,cpp}](../src/inference/OnnxModel.cpp) | ONNX Runtime session, model metadata, zero-copy `Run()` |
 | Tensor helpers | [src/inference/TensorUtils.{h,cpp}](../src/inference/TensorUtils.cpp) | Element-count computation from a tensor shape |
-| Config | [src/utils/Config.{h,cpp}](../src/utils/Config.cpp) | Server defaults and environment override for the payload limit |
+| Config | [src/utils/Config.{h,cpp}](../src/utils/Config.cpp) | Server defaults and environment overrides for payload, admission, and deadlines |
 | Logging | [src/utils/Logger.{h,cpp}](../src/utils/Logger.cpp) | Thread-safe timestamped logging to stdout/stderr |
 | Metrics | [src/utils/Metrics.{h,cpp}](../src/utils/Metrics.cpp) | Singleton JSONL sink for per-inference statistics |
 
@@ -31,6 +31,16 @@ Because inference happens on the worker thread that dequeued the completion, ONN
 - Each entry reserves at most one pending operation. The registry lock serializes posting, socket closure, and completion accounting. An immediate posting failure clears the reservation because Winsock will issue no packet for that attempt.
 - A worker claims a dequeued completion under the lock and holds exclusive access to the connection's protocol state until it posts the next operation or retires the entry. Shutdown can close that socket while the handler runs, including during inference. The registry holds the connection until that handler returns.
 - The listener belongs to the accept thread while it runs. The lifecycle mutex serializes `Start()` and `Stop()`, and socket and port teardown follow the thread joins.
+- Admission checks registry capacity under the same lock that inserts and reserves the initial receive. Excess sockets close before connection buffers or IOCP state are allocated. Pending cancellations and active handlers count against the limit until their entries retire.
+- The accept thread checks pending deadlines under the registry lock. Timeout closes the socket and retains its entry, buffer, and `OVERLAPPED` until the matching packet is accounted for. A completion for a closed socket retires the entry. Posting, timeout closure, and shutdown closure share the same lock.
+
+### Network deadlines
+
+- **Idle receive.** A receive with no partial request has a fresh idle budget, starting when it is posted. This covers newly admitted clients and persistent clients between requests.
+- **Incomplete frame.** The first completion that exposes an incomplete header or payload starts an absolute frame budget. Subsequent fragments keep the same deadline. A partial frame buffered behind a response starts its budget when the final write completion exposes it.
+- **Stalled send.** Each pending send has an idle budget. A positive short completion earns a fresh budget for the remaining suffix.
+
+Deadlines use `std::chrono::steady_clock`. Workers compare them at completion accounting, with equality treated as expiration. Time spent in a handler, including inference, has no pending-I/O timer. The existing accept wait also wakes for a registry scan at the configured interval, including during sustained acceptance. Quiet sockets can close up to one scan interval later, plus thread scheduling delay. Smaller intervals increase scan frequency. Each scan is bounded by the configured connection limit.
 
 ### Shutdown sequence
 

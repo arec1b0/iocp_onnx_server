@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include "server/ConnectionLimits.h"
 
 /// Runtime configuration for the server.
 ///
@@ -11,9 +12,11 @@ struct Config {
     int port;                ///< TCP listen port.
     int workerThreads;       ///< IOCP worker pool size.
     std::uint32_t maxPayloadBytes;  ///< Limit for each float32 payload.
+    ConnectionLimits connectionLimits;
 
     /// Returns the default configuration: models/model.onnx, 0.0.0.0:8080,
-    /// worker count = hardware_concurrency (fallback 2), and a 16 MiB
-    /// payload limit. Returns no value for an invalid environment override.
+    /// worker count = hardware_concurrency (fallback 2), a 16 MiB
+    /// payload limit, and default connection limits. Invalid overrides
+    /// are logged and cause loading to fail.
     static std::optional<Config> Load();
 };

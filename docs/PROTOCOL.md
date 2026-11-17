@@ -5,7 +5,7 @@ The server speaks a minimal length-prefixed binary protocol over raw TCP. There 
 - **Transport:** TCP, default port `8080`
 - **Byte order:** little-endian (x64 native)
 - **Element type:** IEEE-754 `float32` only
-- **Connection model:** persistent — a client may send any number of request/response cycles over one socket; the server never closes a healthy connection
+- **Connection model:** persistent, subject to the configured connection limit and network deadlines
 
 ## Request
 
@@ -49,6 +49,11 @@ The server discards any incomplete frame when the peer disconnects. If
 inference fails after receiving a valid frame, the server sends
 `element_count = 0` with an empty payload. Clients should treat a zero-length
 response as an inference error.
+
+The server closes sockets above the admission limit and connections that
+expire while idle, receiving a partial frame, or sending a response. The
+client may receive a response prefix already sent before a stalled send expired.
+See [network deadlines](ARCHITECTURE.md#network-deadlines) for the timing rules.
 
 ## Client requirements
 

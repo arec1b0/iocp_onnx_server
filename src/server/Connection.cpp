@@ -56,6 +56,10 @@ Protocol::ReadResult Connection::ReadBufferedRequest(std::vector<float>& input) 
     return result;
 }
 
+bool Connection::HasPartialRequest() const noexcept {
+    return readBegin_ != readEnd_ || requestFramer_.AwaitingPayload();
+}
+
 IOContext* Connection::PrepareResponse(std::span<const float> output) {
     if (sendTotalBytes_ != 0 || output.size() > Protocol::MaxPayloadBytes / Protocol::FloatBytes) {
         return nullptr;

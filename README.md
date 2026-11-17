@@ -137,11 +137,23 @@ Defaults are defined in [Config.cpp](src/utils/Config.cpp).
 | `port`         | `8080`               | Listen port                                  |
 | `workerThreads`| `hardware_concurrency` (fallback 2) | IOCP worker pool size          |
 | `IOCP_ONNX_MAX_PAYLOAD_BYTES` | `16777216` | Environment override for the maximum input and output payload size |
+| `IOCP_ONNX_MAX_CONNECTIONS` | `256` | Admitted connections, including pending cancellation. Range 1–65,535 |
+| `IOCP_ONNX_IDLE_TIMEOUT_MS` | `60000` | Idle receive or stalled send budget in milliseconds. Range 1–86,400,000 |
+| `IOCP_ONNX_FRAME_TIMEOUT_MS` | `15000` | Absolute incomplete-frame budget in milliseconds. Range 1–86,400,000 |
+| `IOCP_ONNX_TIMEOUT_CHECK_INTERVAL_MS` | `100` | Timeout scan interval in milliseconds. Range 1–1,000 |
+
+Set overrides before starting the server using up to ten decimal digits.
+Invalid settings fail startup. The server closes excess clients after TCP
+accept. Closing connections still occupy a slot until pending I/O drains.
+Tune the connection count and payload limit together because each admitted
+connection owns receive, payload, and response storage. A smaller scan
+interval closes quiet sockets sooner and increases registry scans.
+See [network deadlines](docs/ARCHITECTURE.md#network-deadlines) for timing rules.
 
 ### Testing
 
 Run the automated tests from the repository root after a Release build.
-The IOCP lifecycle test uses OS-assigned loopback ports. The TCP smoke test
+The IOCP lifecycle and deadline tests use OS-assigned loopback ports. The TCP smoke test
 checks fragmented and pipelined requests against the inference server and
 requires port 8080 to be available.
 

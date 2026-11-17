@@ -23,6 +23,7 @@ namespace Protocol {
         // Advances bytes past the data consumed for one request. The caller
         // retains an incomplete header or any bytes after a complete frame.
         ReadResult Consume(std::span<const char>& bytes, std::vector<float>& input);
+        bool AwaitingPayload() const noexcept { return readingPayload_; }
 
     private:
         const std::size_t expectedPayloadBytes_;

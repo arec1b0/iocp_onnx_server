@@ -11,6 +11,7 @@
 #include <mutex>
 #include <unordered_map>
 #include "Connection.h"
+#include "ConnectionLimits.h"
 
 /// Asynchronous TCP inference server built on Windows I/O Completion Ports.
 ///
@@ -22,9 +23,12 @@
 class IocpServer {
 public:
     using Inference = std::function<std::vector<float>(const std::vector<float>&)>;
+    using Clock = std::chrono::steady_clock;
+    using Now = std::function<Clock::time_point()>;
 
+    /// The clock must be monotonic and safe to call from multiple threads.
     IocpServer(const std::string& ipAddress, int port, int workerThreads,
-               std::size_t inputElements, Inference inference);
+               std::size_t inputElements, Inference inference, ConnectionLimits limits = {}, Now now = Clock::now);
 
     /// Stops the server if still running.
     ~IocpServer();
@@ -46,6 +50,8 @@ private:
     struct ActiveConnection {
         std::unique_ptr<Connection> owner;
         IOContext* pending = nullptr;
+        Clock::time_point deadline{};
+        bool receivingFrame = false;
     };
     using ConnectionRegistry = std::unordered_map<Connection*, ActiveConnection>;
 
@@ -57,9 +63,10 @@ private:
     void ProcessPacket(Connection* conn, OVERLAPPED* overlapped, bool succeeded, DWORD bytesTransferred);
     IOContext* HandleCompletion(Connection& conn, IOOperation operation, DWORD bytesTransferred);
 
-    // Both require the registry lock. A reserved operation pins its entry
+    // These require the registry lock. A reserved operation pins its entry
     // until the worker dequeues the completion or posting fails immediately.
-    bool PostLocked(ActiveConnection& active, IOContext& context);
+    bool PostLocked(ActiveConnection& active, IOContext& context, Clock::time_point observedAt);
+    void CloseExpiredLocked(Clock::time_point now);
     void RetireLocked(ConnectionRegistry::iterator entry);
 
     std::string ipAddress_;
@@ -74,6 +81,8 @@ private:
     std::thread acceptThread_;
     const std::size_t inputElements_;
     const Inference inference_;
+    const ConnectionLimits limits_;
+    const Now now_;
 
     mutable std::mutex lifecycleMutex_;
     std::atomic<bool> stopping_{true};

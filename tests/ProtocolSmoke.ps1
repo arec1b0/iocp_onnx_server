@@ -6,13 +6,20 @@ $serverPath = (Resolve-Path -LiteralPath $ServerExe).Path
 $workingDir = [IO.Directory]::CreateTempSubdirectory('iocp-protocol-')
 $modelDir = Join-Path $workingDir.FullName 'models'
 
-function Start-TestServer([string] $Limit) {
+function Start-TestServer([string] $Limit, [hashtable] $Overrides = @{}) {
     $start = [Diagnostics.ProcessStartInfo]::new($serverPath)
     $start.WorkingDirectory = $workingDir.FullName
     $start.UseShellExecute = $false
     $start.CreateNoWindow = $true
     $start.RedirectStandardError = $true
     $start.Environment['IOCP_ONNX_MAX_PAYLOAD_BYTES'] = $Limit
+    $start.Environment['IOCP_ONNX_MAX_CONNECTIONS'] = '4'
+    $start.Environment['IOCP_ONNX_IDLE_TIMEOUT_MS'] = '5000'
+    $start.Environment['IOCP_ONNX_FRAME_TIMEOUT_MS'] = '3000'
+    $start.Environment['IOCP_ONNX_TIMEOUT_CHECK_INTERVAL_MS'] = '25'
+    foreach ($setting in $Overrides.GetEnumerator()) {
+        $start.Environment[$setting.Key] = $setting.Value
+    }
     [Diagnostics.Process]::Start($start)
 }
 
@@ -22,6 +29,21 @@ function Stop-TestServer([Diagnostics.Process] $Process) {
         if (-not $Process.WaitForExit(5000)) { throw 'Test server did not exit.' }
     }
     $Process.Dispose()
+}
+
+function Assert-StartupRejected([string] $Limit, [hashtable] $Overrides, [string] $Expected) {
+    $server = Start-TestServer $Limit $Overrides
+    $errors = $server.StandardError.ReadToEndAsync()
+    try {
+        if (-not $server.WaitForExit(5000) -or $server.ExitCode -ne 1) {
+            throw "Expected startup to reject $Expected."
+        }
+        if ($errors.GetAwaiter().GetResult() -notlike "*$Expected*") {
+            throw "Startup rejected the configuration for an unexpected reason. Expected $Expected."
+        }
+    } finally {
+        Stop-TestServer $server
+    }
 }
 
 function Connect-TestClient {
@@ -154,18 +176,22 @@ try {
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot '../models/model.onnx') -Destination $modelDir
 
     foreach ($limit in @('39', '40x', '4294967288', '4294967296')) {
-        $server = Start-TestServer $limit
-        $errors = $server.StandardError.ReadToEndAsync()
-        try {
-            if (-not $server.WaitForExit(5000) -or $server.ExitCode -ne 1) {
-                throw "Expected startup to fail for payload limit $limit."
-            }
-            $expected = if ($limit -eq '39') { 'Model input or output exceeds' } else { 'must be a decimal integer' }
-            if ($errors.GetAwaiter().GetResult() -notlike "*$expected*") {
-                throw "Startup rejected payload limit $limit for an unexpected reason."
-            }
-        } finally {
-            Stop-TestServer $server
+        $expected = if ($limit -eq '39') { 'Model input or output exceeds' } else {
+            'IOCP_ONNX_MAX_PAYLOAD_BYTES must be a decimal integer'
+        }
+        Assert-StartupRejected $limit @{} $expected
+    }
+    $invalidSettings = @{
+        IOCP_ONNX_MAX_CONNECTIONS = @('0', '65536')
+        IOCP_ONNX_IDLE_TIMEOUT_MS = @('-1', '86400001')
+        IOCP_ONNX_FRAME_TIMEOUT_MS = @('0', '1.5', '86400001')
+        IOCP_ONNX_TIMEOUT_CHECK_INTERVAL_MS = @('0', '1001')
+    }
+    foreach ($setting in $invalidSettings.GetEnumerator()) {
+        foreach ($value in $setting.Value) {
+            $override = @{}
+            $override[$setting.Key] = $value
+            Assert-StartupRejected '40' $override "$($setting.Key) must be a decimal integer"
         }
     }
 
@@ -196,7 +222,7 @@ try {
     } finally {
         Stop-TestServer $server
     }
-    Write-Host 'TCP protocol smoke test passed.'
+    Write-Host 'TCP protocol smoke test passed with configured connection limits and timeouts.'
 } finally {
     foreach ($path in @((Join-Path $modelDir 'model.onnx'), (Join-Path $workingDir.FullName 'metrics.jsonl'), $modelDir, $workingDir.FullName)) {
         if (Test-Path -LiteralPath $path) {

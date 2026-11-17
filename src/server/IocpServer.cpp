@@ -1,5 +1,6 @@
 #include "IocpServer.h"
 #include <ws2tcpip.h>
+#include <algorithm>
 #include <cassert>
 #include <chrono>
 #include <numeric>
@@ -12,10 +13,10 @@ namespace {
 }
 
 IocpServer::IocpServer(const std::string& ipAddress, int port, int workerThreads,
-                       std::size_t inputElements, Inference inference)
+                       std::size_t inputElements, Inference inference, ConnectionLimits limits, Now now)
     : ipAddress_(ipAddress), port_(port), workerThreads_(workerThreads),
       listenSocket_(INVALID_SOCKET), iocpHandle_(nullptr),
-      inputElements_(inputElements), inference_(std::move(inference)) {}
+      inputElements_(inputElements), inference_(std::move(inference)), limits_(limits), now_(std::move(now)) {}
 
 IocpServer::~IocpServer() {
     Stop();
@@ -26,7 +27,7 @@ bool IocpServer::Start() {
     if (winsockStarted_) {
         return true;
     }
-    if (port_ < 0 || port_ > 65535 || workerThreads_ <= 0 || !inference_ ||
+    if (port_ < 0 || port_ > 65535 || workerThreads_ <= 0 || !inference_ || !now_ || !limits_.IsValid() ||
         inputElements_ > Protocol::MaxPayloadBytes / Protocol::FloatBytes) {
         LOG_ERR("Invalid server configuration.");
         return false;
@@ -156,11 +157,22 @@ void IocpServer::StopLocked() {
 }
 
 void IocpServer::AcceptThread() {
+    auto nextTimeoutCheck = now_() + limits_.checkInterval;
     while (!stopping_.load()) {
+        const auto now = now_();
+        if (now >= nextTimeoutCheck) {
+            std::lock_guard registry(registryMutex_);
+            CloseExpiredLocked(now);
+            nextTimeoutCheck = now + limits_.checkInterval;
+        }
+
+        using std::chrono::milliseconds;
+        const auto wait = (std::min)(milliseconds(ShutdownCheckMs),
+                                    std::chrono::ceil<milliseconds>(nextTimeoutCheck - now));
         fd_set readable;
         FD_ZERO(&readable);
         FD_SET(listenSocket_, &readable);
-        const timeval timeout{0, ShutdownCheckMs * 1000};
+        const timeval timeout{0, static_cast<long>(wait.count() * 1000)};
         const int ready = select(0, &readable, nullptr, nullptr, &timeout);
         if (ready == SOCKET_ERROR) {
             LOG_ERR("Listener readiness check failed.");
@@ -187,27 +199,39 @@ void IocpServer::AcceptThread() {
 }
 
 void IocpServer::Admit(SocketHandle socket) {
-    auto owner = std::make_unique<Connection>(std::move(socket), inputElements_ * Protocol::FloatBytes);
-    auto* conn = owner.get();
     std::lock_guard registry(registryMutex_);
-    if (stopping_.load()) {
+    if (stopping_.load() || connections_.size() >= limits_.maxConnections) {
         return;
     }
+    auto owner = std::make_unique<Connection>(std::move(socket), inputElements_ * Protocol::FloatBytes);
+    auto* conn = owner.get();
     if (!CreateIoCompletionPort(reinterpret_cast<HANDLE>(conn->GetSocket()), iocpHandle_,
                                 reinterpret_cast<ULONG_PTR>(conn), 0)) {
         LOG_ERR("Could not associate client socket with IOCP.");
         return;
     }
     auto entry = connections_.emplace(conn, ActiveConnection{std::move(owner)}).first;
-    if (!PostLocked(entry->second, *conn->PrepareRead())) {
+    if (!PostLocked(entry->second, *conn->PrepareRead(), now_())) {
         RetireLocked(entry);
     }
 }
 
-bool IocpServer::PostLocked(ActiveConnection& active, IOContext& context) {
+bool IocpServer::PostLocked(ActiveConnection& active, IOContext& context, Clock::time_point observedAt) {
     assert(active.pending == nullptr);
     const auto socket = active.owner->GetSocket();
     if (stopping_.load() || socket == INVALID_SOCKET) {
+        return false;
+    }
+
+    const auto now = now_();
+    const bool receivingFrame = context.operation == IOOperation::Read && active.owner->HasPartialRequest();
+    if (!receivingFrame) {
+        active.deadline = now + limits_.idleTimeout;
+    } else if (!active.receivingFrame) {
+        active.deadline = observedAt + limits_.frameTimeout;
+    }
+    active.receivingFrame = receivingFrame;
+    if (now >= active.deadline) {
         return false;
     }
 
@@ -223,6 +247,18 @@ bool IocpServer::PostLocked(ActiveConnection& active, IOContext& context) {
     }
     active.pending = nullptr;
     return false;
+}
+
+void IocpServer::CloseExpiredLocked(Clock::time_point now) {
+    if (stopping_.load()) {
+        return;
+    }
+    for (auto& entry : connections_) {
+        auto& active = entry.second;
+        if (active.pending && now >= active.deadline) {
+            active.owner->Close();
+        }
+    }
 }
 
 void IocpServer::RetireLocked(ConnectionRegistry::iterator entry) {
@@ -253,6 +289,7 @@ void IocpServer::WorkerThread() {
 
 void IocpServer::ProcessPacket(Connection* conn, OVERLAPPED* overlapped, bool succeeded, DWORD bytesTransferred) {
     IOOperation operation;
+    Clock::time_point observedAt;
     {
         std::lock_guard registry(registryMutex_);
         auto entry = connections_.find(conn);
@@ -263,7 +300,9 @@ void IocpServer::ProcessPacket(Connection* conn, OVERLAPPED* overlapped, bool su
         }
         operation = entry->second.pending->operation;
         entry->second.pending = nullptr;
-        if (stopping_.load() || !succeeded || bytesTransferred == 0) {
+        observedAt = now_();
+        if (stopping_.load() || !succeeded || bytesTransferred == 0 ||
+            entry->second.owner->GetSocket() == INVALID_SOCKET || observedAt >= entry->second.deadline) {
             RetireLocked(entry);
             return;
         }
@@ -281,7 +320,7 @@ void IocpServer::ProcessPacket(Connection* conn, OVERLAPPED* overlapped, bool su
     std::lock_guard registry(registryMutex_);
     auto entry = connections_.find(conn);
     assert(entry != connections_.end());
-    if (!next || !PostLocked(entry->second, *next)) {
+    if (!next || !PostLocked(entry->second, *next, observedAt)) {
         RetireLocked(entry);
     }
 }

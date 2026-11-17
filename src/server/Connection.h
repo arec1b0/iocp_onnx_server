@@ -44,6 +44,7 @@ public:
     IOContext* PrepareRead();
     Protocol::ReadResult ReadRequest(std::size_t bytesReceived, std::vector<float>& input);
     Protocol::ReadResult ReadBufferedRequest(std::vector<float>& input);
+    bool HasPartialRequest() const noexcept;
 
     /// Encodes a response and prepares its first send. Rejects a new response
     /// while a previous response is in progress.

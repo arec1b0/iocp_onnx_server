@@ -1,8 +1,32 @@
 #include "Config.h"
+#include "Logger.h"
 #include "server/Protocol.h"
 #include <windows.h>
 #include <charconv>
 #include <thread>
+
+namespace {
+    std::optional<std::uint32_t> ReadOverride(const char* name, std::uint32_t fallback,
+                                              std::uint32_t minimum, std::uint32_t maximum) {
+        char digits[11];
+        SetLastError(ERROR_SUCCESS);
+        const DWORD length = GetEnvironmentVariableA(name, digits, sizeof(digits));
+        if (length == 0 && GetLastError() == ERROR_ENVVAR_NOT_FOUND) {
+            return fallback;
+        }
+        if (length != 0 && length < sizeof(digits)) {
+            std::uint32_t value = 0;
+            const auto end = digits + length;
+            const auto [parsedEnd, error] = std::from_chars(digits, end, value);
+            if (error == std::errc{} && parsedEnd == end && value >= minimum && value <= maximum) {
+                return value;
+            }
+        }
+        LOG_ERR(std::string(name) + " must be a decimal integer from " +
+                std::to_string(minimum) + " to " + std::to_string(maximum) + ".");
+        return std::nullopt;
+    }
+}
 
 std::optional<Config> Config::Load() {
     Config config;
@@ -13,22 +37,23 @@ std::optional<Config> Config::Load() {
     unsigned int hardware_threads = std::thread::hardware_concurrency();
     config.workerThreads = hardware_threads > 0 ? hardware_threads : 2;
 
-    config.maxPayloadBytes = Protocol::DefaultMaxPayloadBytes;
-    char limit[11]; // Ten decimal digits and a terminator for uint32_t.
-    SetLastError(ERROR_SUCCESS);
-    const DWORD length = GetEnvironmentVariableA("IOCP_ONNX_MAX_PAYLOAD_BYTES", limit, sizeof(limit));
-    if (length == 0 && GetLastError() == ERROR_ENVVAR_NOT_FOUND) {
-        return config;
-    }
-    if (length == 0 || length >= sizeof(limit)) {
+    const auto payload = ReadOverride("IOCP_ONNX_MAX_PAYLOAD_BYTES", Protocol::DefaultMaxPayloadBytes,
+                                      Protocol::FloatBytes, Protocol::MaxPayloadBytes);
+    const ConnectionLimits defaults;
+    const auto connections = ReadOverride("IOCP_ONNX_MAX_CONNECTIONS", defaults.maxConnections,
+                                          1, ConnectionLimits::MaxConnectionCount);
+    const auto idle = ReadOverride("IOCP_ONNX_IDLE_TIMEOUT_MS", static_cast<std::uint32_t>(defaults.idleTimeout.count()),
+                                   1, ConnectionLimits::MaxTimeoutMs);
+    const auto frame = ReadOverride("IOCP_ONNX_FRAME_TIMEOUT_MS", static_cast<std::uint32_t>(defaults.frameTimeout.count()),
+                                    1, ConnectionLimits::MaxTimeoutMs);
+    const auto interval = ReadOverride("IOCP_ONNX_TIMEOUT_CHECK_INTERVAL_MS",
+                                       static_cast<std::uint32_t>(defaults.checkInterval.count()),
+                                       1, ConnectionLimits::MaxCheckIntervalMs);
+    if (!payload || !connections || !idle || !frame || !interval) {
         return std::nullopt;
     }
-
-    const auto end = limit + length;
-    const auto [parsedEnd, error] = std::from_chars(limit, end, config.maxPayloadBytes);
-    if (error != std::errc{} || parsedEnd != end ||
-        config.maxPayloadBytes < Protocol::FloatBytes || config.maxPayloadBytes > Protocol::MaxPayloadBytes) {
-        return std::nullopt;
-    }
+    using std::chrono::milliseconds;
+    config.maxPayloadBytes = *payload;
+    config.connectionLimits = {*connections, milliseconds(*idle), milliseconds(*frame), milliseconds(*interval)};
     return config;
 }
