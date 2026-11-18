@@ -2,6 +2,44 @@
 
 Run these commands from the repository root in PowerShell 7 on Windows x64. MSVC v143, the Windows SDK, and an extracted x64 ONNX Runtime distribution are required. CMake defaults to `C:/onnxruntime`. Set `-DONNXRUNTIME_DIR=<path>` to use another extraction. The CLI tests and benchmark need port 8080 free. The harness connects only to IPv4 loopback, and the server under test uses its usual listener on all IPv4 interfaces. Run the tests on an isolated test host.
 
+## Windows CI parity
+
+The CI package is Microsoft's `Microsoft.ML.OnnxRuntime` 1.18.1. The previously configured GitHub release ZIP returned `404` during hosted provisioning. The replacement stays at 1.18.1, verifies the pinned SHA-256 before extraction, and selects only the Windows x64 native files and headers. The pinned package was checked with `dotnet nuget verify` against its timestamped Microsoft author and NuGet repository signatures. The provisioning script takes a fresh output directory and can also verify a saved archive via `-PackageFile`.
+
+```powershell
+$ErrorActionPreference = 'Stop'
+$PSNativeCommandUseErrorActionPreference = $true
+$run = "build/windows-parity-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+./scripts/Provision-OnnxRuntime.ps1 -OutputDirectory "$run/ort"
+$ort = (Resolve-Path "$run/ort").Path
+
+$vswhere = "${env:ProgramFiles(x86)}/Microsoft Visual Studio/Installer/vswhere.exe"
+$vs = & $vswhere -latest -version '[17.0,18.0)' -products '*' -requires Microsoft.VisualStudio.Component.VC.ASAN -property installationPath
+$toolVersion = (Get-Content (Join-Path $vs 'VC/Auxiliary/Build/Microsoft.VCToolsVersion.default.txt') -Raw).Trim()
+$env:PATH = "$(Join-Path $vs "VC/Tools/MSVC/$toolVersion/bin/Hostx64/x64");$env:PATH"
+
+foreach ($variant in 'release', 'asan') {
+    $build = "$run/$variant"
+    $flags = @()
+    if ($variant -eq 'asan') {
+        $flags += '-DCMAKE_CXX_FLAGS=/EHsc /Zi /fsanitize=address', '-DCMAKE_EXE_LINKER_FLAGS=/DEBUG:FULL /INCREMENTAL:NO'
+    }
+    cmake -S . -B $build -G 'Visual Studio 17 2022' -A x64 "-DONNXRUNTIME_DIR=$ort" @flags
+    cmake --build $build --config Release --parallel 1 -- /nr:false
+    ctest --test-dir $build -C Release --timeout 90 --output-on-failure
+    $server = "$build/Release/iocp_onnx_server.exe"
+    ./tests/ProtocolSmoke.ps1 -ServerExe $server
+    pwsh -NoProfile -NonInteractive -File tests/StdoutBackpressure.ps1 `
+        -ServerExe $server -OutputDirectory "$run/stdout-$variant"
+}
+./tests/ReliabilitySoak.ps1 -ServerExe "$run/release/Release/iocp_onnx_server.exe" `
+    -DurationSeconds 120 -ConnectionDiagnostics -OutputDirectory "$run/mixed"
+./tests/AnalyzeConnectionTrace.ps1 -Directory "$run/mixed"
+git diff --check
+```
+
+The historical Windows TCP/IP event 4227 confirmed an outbound endpoint reuse failure during churn. The historical healthy-client reset and early EOF remain unresolved, and the bounded overlap did not reproduce either. Keep those findings separate from an isolated smoke or a clean connection drain. Deployment readiness also depends on TLS and authentication at the service boundary, a policy for inference calls that cannot be interrupted, and the documented synchronous console and file output limitations.
+
 ## Release, fault tests, and AddressSanitizer
 
 ```powershell

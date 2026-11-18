@@ -201,9 +201,11 @@ Every inference appends one JSON line to `metrics.jsonl` in the working director
 ## CI
 
 The [Windows CI workflow](.github/workflows/ci.yml) runs on pushes and pull
-requests to `master`. It provisions ONNX Runtime 1.18.1 and runs all CTest
-suites and the TCP smoke test with MSVC x64 Release and AddressSanitizer builds.
-It uploads build and test diagnostics and the Release binary.
+requests to `master`. It verifies a pinned SHA-256 for Microsoft's ONNX Runtime
+1.18.1 NuGet package and extracts the native x64 files. MSVC Release and
+AddressSanitizer jobs run all CTest suites, the TCP smoke test, and the blocked
+stdout regression. The workflow uploads setup and test diagnostics and the
+Release binary. See the [local CI parity commands](docs/RELIABILITY.md#windows-ci-parity).
 
 ## Known Limitations
 
