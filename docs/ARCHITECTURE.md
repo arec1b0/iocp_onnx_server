@@ -144,7 +144,7 @@ aggregate snapshot. The payload and model inputs stay out of these records.
 
 ### Inference metrics
 
-`Metrics` is a mutex-guarded singleton appending one JSON line per inference to `metrics.jsonl` (opened in append mode in the process working directory):
+`Metrics` formats each inference record into a 256-byte worker-local buffer, then takes the sink mutex for one buffered append to `metrics.jsonl` in the process working directory.
 
 | Field | Meaning |
 |-------|---------|
@@ -152,6 +152,14 @@ aggregate snapshot. The payload and model inputs stay out of these records.
 | `latency_ms` | Wall-clock duration of `RunInference` only |
 | `input_mean`, `input_stddev` | Input tensor statistics, computed on the worker thread — the drift signal |
 | `element_count` | Input tensor size |
+
+The formatter uses locale-independent decimal conversion and retains six significant digits for finite floating-point fields. Records are ordered by successful append under the mutex. Concurrent workers can generate timestamps before acquiring that mutex. A non-finite number or a record that exceeds the buffer rejects the entire record and increments the rejection count. Later valid records can still be written.
+
+The file sink assumes one server writer per working directory. Opening an existing file checks for an empty file or a final newline. An unterminated tail is preserved for inspection and the sink stays unavailable for that run. An append or flush failure fences subsequent appends. The server counts skipped records and continues inference. A short write can leave a partial final record in the file. Readers should treat a reported tail failure as incomplete telemetry.
+
+Once both worker pools have joined, the server checks the final flush and close. The failure report includes buffered `appended` records, `flushed` records credited at successful flush boundaries, conservative `unconfirmed` records, and counts of rejected records, failed writes and skipped attempts. Automatic stream-buffer writes can reach the OS before final confirmation. A successful flush and close confirms delivery to the OS. Durable media persistence requires a separate guarantee. An orderly run returns exit status 4 on inference metrics failure. Exit status 3 remains the combined application and logging-delivery failure status when neither diagnostic stream can report the outcome.
+
+The sink is synchronous and file operations execute outside the connection registry mutex. A stalled filesystem can block a producer, fill the bounded inference queue, and delay shutdown while producers join or the sink closes. Stdout pipe backpressure has a separate policy.
 
 The intent is lightweight **model/data drift detection** without external dependencies: a change in the input distribution (e.g. an upstream feature pipeline bug) appears as a step in `input_mean` long before model quality metrics would reveal it. `scripts/analyze_metrics.py` visualizes both series; `scripts/load_test.py` deliberately injects a mid-test mean shift to demonstrate the mechanism.
 

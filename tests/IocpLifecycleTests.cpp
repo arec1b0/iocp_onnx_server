@@ -1,4 +1,5 @@
 #include "server/IocpServer.h"
+#include "utils/Metrics.h"
 #include <psapi.h>
 #include <algorithm>
 #include <array>
@@ -93,7 +94,7 @@ struct IocpServerTestAccess {
         server.failWorkerLaunchAt_ = workerIndex;
     }
 
-    static void AfterSendSubmission(IocpServer& server, std::function<void()> callback) {
+    static void AfterSendSubmission(IocpServer& server, std::function<void(int)> callback) {
         server.afterSendSubmission_ = std::move(callback);
     }
 
@@ -964,7 +965,7 @@ namespace {
         InferenceGate gate;
         ManualClock clock;
         IocpServer server("127.0.0.1", 0, 2, 1, Echo, TestLimits, [&] { return clock.Now(); });
-        Inspect::AfterSendSubmission(server, [&] {
+        Inspect::AfterSendSubmission(server, [&](int) {
             gate.entered.release();
             (void)gate.ready.wait_for(15s);
         });
@@ -1001,6 +1002,46 @@ namespace {
         std::cout << (stopDuringSubmission ? "Shutdown" : "Timeout")
                   << " raced safely with a send submission and early completion.\n";
     }
+
+    void TestSingleWorkerEarlyCompletion() {
+        InferenceGate gate;
+        bool firstSubmission = true;
+        int sendStatus = -1;
+        IocpServer server("127.0.0.1", 0, 1, 1, Echo, {}, IocpServer::Clock::now, nullptr, {1, 2});
+        Inspect::AfterSendSubmission(server, [&](int error) {
+            if (!firstSubmission) return;
+            firstSubmission = false;
+            sendStatus = error;
+            gate.entered.release();
+            (void)gate.ready.wait_for(15s);
+        });
+        Check(server.Start(), "single-worker submission server did not start");
+        auto first = Connect(server.BoundPort());
+        const auto before = MakeRequest(1.0f);
+        const auto after = MakeRequest(2.0f);
+        std::vector<char> pipelined(before.begin(), before.end());
+        pipelined.insert(pipelined.end(), after.begin(), after.end());
+        SendBytes(first.Get(), pipelined);
+        CheckResponse(first.Get(), before);
+        Check(gate.entered.try_acquire_for(4s), "single-worker send did not enter the gate");
+        Check(sendStatus == 0 || sendStatus == WSA_IO_PENDING, "initial Winsock send failed");
+        WaitFor([&] { return Inspect::HasEarlyCompletion(server); }, "single IOCP worker did not observe the early packet");
+
+        auto second = Connect(server.BoundPort());
+        const auto other = SendRequest(second.Get(), 3.0f);
+        WaitFor([&] {
+            const auto snapshot = Inspect::Inspect(server);
+            return snapshot.submitting == 1 && snapshot.reads == 1 && snapshot.metrics.pending_io_operations == 1;
+        }, "early-packet wait prevented unrelated connection admission");
+
+        gate.release.set_value();
+        CheckResponse(first.Get(), after);
+        CheckResponse(second.Get(), other);
+        server.Stop();
+        Check(Inspect::Stopped(server), "single-worker early completion retained resources");
+        CheckDrainedMetrics(server, ConnectionLimits{}.maxConnections);
+        std::cout << "Single-worker early completion and two ordered clients drained. WSASend status=" << sendStatus << '\n';
+    }
 }
 
 int main(int argc, char** argv) {
@@ -1029,6 +1070,10 @@ int main(int argc, char** argv) {
                 TestInferenceQueueShutdownAndRestart();
                 TestEarlyCompletionDuringSendSubmission(true);
                 TestEarlyCompletionDuringSendSubmission(false);
+                TestSingleWorkerEarlyCompletion();
+                const auto delivery = Metrics::GetInstance().Close();
+                Check(delivery.Complete() && delivery.flushed == 13, "scheduler inference records did not reconcile");
+                std::cout << "Scheduler drained 13 metrics records across saturation, cancellation and early completion.\n";
             } else {
                 TestReceiveDisconnect();
                 TestSendDisconnect();

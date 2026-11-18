@@ -3,13 +3,21 @@ param(
     [Parameter(Mandatory)][string] $CandidateExe,
     [Parameter(Mandatory)][string] $OutputDirectory,
     [string] $Model = (Join-Path $PSScriptRoot '../models/model.onnx'),
-    [ValidateSet('Compare', 'Sweep', 'ProfileOverhead')][string] $Mode = 'Compare',
+    [ValidateSet('Compare', 'Sweep', 'ProfileOverhead', 'MetricsSink', 'MetricsOptimization')][string] $Mode = 'Compare',
     [string] $Stage1Exe,
     [string] $ReferenceExe,
+    [string] $BypassExe,
     [string] $ReferenceLabel = 'stage21',
+    [ValidateRange(0, 64)][int] $ReferenceWorkers = 0,
     [string] $CandidateLabel = 'candidate',
     [switch] $ProfileBoth,
     [switch] $ContextSwitches,
+    [uint64] $ServerAffinityMask = 0,
+    [uint64] $ClientAffinityMask = 0,
+    [switch] $SplitMetrics,
+    [switch] $UnprofiledSweep,
+    [switch] $StandardWorkerSweep,
+    [switch] $RequireMetricsRecords,
     [ValidateRange(1, 63)][int] $Rounds = 15,
     [ValidateRange(1, 32)][int] $Clients = 8,
     [ValidateRange(1, 128)][int] $ConnectionsPerClient = 4,
@@ -23,10 +31,16 @@ $ErrorActionPreference = 'Stop'
 Add-Type -Path (Join-Path $PSScriptRoot 'ReliabilityHarness.cs')
 Add-Type -Path (Join-Path $PSScriptRoot 'ConnectionBenchmarkClient.cs')
 
-function New-Variant([string] $Label, [string] $Exe, [int] $WorkerCount, [int] $Queue, [bool] $Profile) {
+if ($StandardWorkerSweep) {
+    if ($Mode -ne 'Sweep') { throw 'StandardWorkerSweep requires Sweep mode.' }
+    $Workers = @(1, 2, 4, 8)
+}
+
+function New-Variant([string] $Label, [string] $Exe, [int] $WorkerCount, [int] $Queue, [bool] $Profile,
+                     [string] $Sink = 'file') {
     [pscustomobject]@{
         Label = $Label; Exe = (Resolve-Path -LiteralPath $Exe).Path; Workers = $WorkerCount
-        Queue = $Queue; Profile = $Profile; Sha256 = (Get-FileHash -LiteralPath $Exe).Hash
+        Queue = $Queue; Profile = $Profile; Sink = $Sink; Sha256 = (Get-FileHash -LiteralPath $Exe).Hash
     }
 }
 
@@ -34,19 +48,40 @@ $variants = @(
     if ($Mode -eq 'Sweep') {
         foreach ($workerCount in $Workers) {
             foreach ($queue in $Queues) {
-                New-Variant "w${workerCount}-q${queue}" $CandidateExe $workerCount $queue $true
+                New-Variant "w${workerCount}-q${queue}" $CandidateExe $workerCount $queue (-not $UnprofiledSweep)
             }
         }
     } elseif ($Mode -eq 'ProfileOverhead') {
         New-Variant 'profile_off' $CandidateExe $Workers[0] $Queues[0] $false
         New-Variant 'profile_on' $CandidateExe $Workers[0] $Queues[0] $true
+    } elseif ($Mode -eq 'MetricsSink') {
+        foreach ($sink in 'file', 'null', 'memory', 'bypass') {
+            New-Variant $sink $CandidateExe $Workers[0] $Queues[0] $ProfileBoth $sink
+        }
+    } elseif ($Mode -eq 'MetricsOptimization') {
+        if (-not $ReferenceExe -or -not $BypassExe) { throw 'Supply the original sink and diagnostic bypass executables.' }
+        New-Variant 'stage23' $ReferenceExe $Workers[0] $Queues[0] $ProfileBoth
+        New-Variant 'stage24' $CandidateExe $Workers[0] $Queues[0] $ProfileBoth
+        New-Variant 'bypass' $BypassExe $Workers[0] $Queues[0] $ProfileBoth 'bypass'
     } else {
         if ($Stage1Exe) { New-Variant 'stage1' $Stage1Exe $Workers[0] $Queues[0] $false }
-        if ($ReferenceExe) { New-Variant $ReferenceLabel $ReferenceExe $Workers[0] $Queues[0] $ProfileBoth }
+        if ($ReferenceExe) {
+            $referenceCount = if ($ReferenceWorkers) { $ReferenceWorkers } else { $Workers[0] }
+            New-Variant $ReferenceLabel $ReferenceExe $referenceCount $Queues[0] $ProfileBoth
+        }
         New-Variant $CandidateLabel $CandidateExe $Workers[0] $Queues[0] $ProfileBoth
     }
 )
 if (@($variants.Label | Sort-Object -Unique).Count -ne $variants.Count) { throw 'Variant labels must be unique.' }
+
+$controller = [Diagnostics.Process]::GetCurrentProcess()
+$originalAffinity = [uint64]$controller.ProcessorAffinity.ToInt64()
+if ($ClientAffinityMask -and -not $ServerAffinityMask) { throw 'A client mask requires an explicit server mask.' }
+if (($ServerAffinityMask -band $ClientAffinityMask) -ne 0 -or
+    (($ServerAffinityMask -bor $ClientAffinityMask) -band $originalAffinity) -ne ($ServerAffinityMask -bor $ClientAffinityMask)) {
+    throw 'Server and client affinity masks must be disjoint subsets of the controller affinity.'
+}
+if ($SplitMetrics -and $Mode -ne 'MetricsSink') { throw 'SplitMetrics requires the diagnostic metrics build and MetricsSink mode.' }
 
 $modelPath = (Resolve-Path -LiteralPath $Model).Path
 if (Test-Path -LiteralPath $OutputDirectory) { throw 'Choose a fresh output directory.' }
@@ -57,6 +92,7 @@ $stdout = Join-Path $output 'server.stdout.log'
 $stderr = Join-Path $output 'server.stderr.log'
 $trace = Join-Path $output 'inference-profile.json'
 $metrics = Join-Path $output 'metrics.jsonl'
+$sinkProfile = Join-Path $output 'metrics-sink-profile.json'
 $jsonl = Join-Path $output 'trials.jsonl'
 
 # The harness runs in its own PowerShell process and launches a dedicated server console.
@@ -77,14 +113,16 @@ function Get-SwitchSnapshot([int] $ProcessId) {
 }
 
 function Invoke-Trial($Variant, [int] $Round) {
-    foreach ($file in $stdout, $stderr, $trace, $metrics) {
+    foreach ($file in $stdout, $stderr, $trace, $metrics, $sinkProfile) {
         if (Test-Path -LiteralPath $file) { Remove-Item -LiteralPath $file }
     }
     $env:IOCP_ONNX_INFERENCE_WORKERS = [string]$Variant.Workers
     $env:IOCP_ONNX_INFERENCE_QUEUE_CAPACITY = [string]$Variant.Queue
     $env:IOCP_ONNX_INFERENCE_PROFILE = if ($Variant.Profile) { '1' } else { '0' }
+    $env:IOCP_BENCH_METRICS_MODE = $Variant.Sink
+    $env:IOCP_BENCH_METRICS_SPLIT = if ($SplitMetrics) { '1' } else { '0' }
     $allowReject = $Mode -eq 'Sweep' -and $Variant.Queue -lt $Clients
-    $server = [ReliabilityHarness]::StartServer($Variant.Exe, $output, $stdout, $stderr)
+    $server = [ReliabilityHarness]::StartServer($Variant.Exe, $output, $stdout, $stderr, $ServerAffinityMask)
     try {
         $deadline = [Diagnostics.Stopwatch]::StartNew()
         while ($true) {
@@ -102,11 +140,21 @@ function Invoke-Trial($Variant, [int] $Round) {
         $warm = [ConnectionBenchmarkClient]::Run($Clients, 1, $BurstsPerConnection, $allowReject)
         if ($ContextSwitches) { $beforeSwitch = Get-SwitchSnapshot $server.Id }
         $server.Refresh()
+        $observedAffinity = [uint64]$server.ProcessorAffinity.ToInt64()
+        if ($ServerAffinityMask -and $observedAffinity -ne $ServerAffinityMask) { throw 'Server affinity differs from the requested mask.' }
+        $threadCount = $server.Threads.Count
         $beforeCpu = $server.TotalProcessorTime.TotalMilliseconds
+        $controller.Refresh()
+        $beforeClientCpu = $controller.TotalProcessorTime.TotalMilliseconds
         $sample = [ConnectionBenchmarkClient]::Run($Clients, $ConnectionsPerClient, $BurstsPerConnection, $allowReject)
+        $controller.Refresh()
+        $clientCpu = $controller.TotalProcessorTime.TotalMilliseconds - $beforeClientCpu
         $server.Refresh()
         $cpu = $server.TotalProcessorTime.TotalMilliseconds - $beforeCpu
         $privateBytes = $server.PrivateMemorySize64
+        if ($ServerAffinityMask -and [uint64]$server.ProcessorAffinity.ToInt64() -ne $ServerAffinityMask) {
+            throw 'Server affinity changed during measurement.'
+        }
         $switches = $null
         if ($ContextSwitches) {
             $afterSwitch = Get-SwitchSnapshot $server.Id
@@ -135,13 +183,28 @@ function Invoke-Trial($Variant, [int] $Round) {
                 throw 'Client output and the scheduler accounting did not reconcile.'
             }
         }
+        $sink = if ($SplitMetrics) { Get-Content -LiteralPath $sinkProfile -Raw | ConvertFrom-Json }
+        $expectedRecords = $warm.Completed + $sample.Completed
+        if ($Mode -in 'MetricsSink', 'MetricsOptimization' -or $RequireMetricsRecords) {
+            if (Select-String -LiteralPath $stderr -Pattern 'Failed to open benchmark metrics sink' -Quiet) {
+                throw 'The benchmark metrics sink could not be opened.'
+            }
+            if ($Variant.Sink -eq 'file') {
+                [ConnectionBenchmarkClient]::ValidateMetricsFile($metrics, $expectedRecords)
+            } elseif (Test-Path -LiteralPath $metrics) { throw 'A diagnostic non-file sink created a metrics file.' }
+            if ($sink -and $sink.records -ne $expectedRecords) { throw 'Sink timing count did not reconcile.' }
+        }
         [ordered]@{
             round = $Round; variant = $Variant.Label; workers = $Variant.Workers; capacity = $Variant.Queue
             completed = $sample.Completed; early_eof = $sample.EarlyEof; reset_10054 = $sample.Reset; aborted_10053 = $sample.Aborted
             elapsed_ms = $sample.ElapsedMs; requests_per_second = 1000 * $sample.Completed / $sample.ElapsedMs
             p50_ms = $sample.P50Ms; p95_ms = $sample.P95Ms; p99_ms = $sample.P99Ms
             cpu_ms = $cpu; cpu_cores = $cpu / $sample.ElapsedMs; private_bytes = $privateBytes
-            context_switches = $switches; profile = $profile
+            client_cpu_cores = $clientCpu / $sample.ElapsedMs
+            cpu_seconds_per_1000 = if ($sample.Completed) { $cpu / $sample.Completed }
+            requests_per_cpu_second = if ($cpu -gt 0) { 1000 * $sample.Completed / $cpu }
+            affinity_mask = $observedAffinity; threads_after_warmup = $threadCount
+            context_switches = $switches; profile = $profile; sink_profile = $sink
         }
     } finally {
         if (-not $server.HasExited) { $server.Kill(); $null = $server.WaitForExit(5000) }
@@ -151,35 +214,43 @@ function Invoke-Trial($Variant, [int] $Round) {
 
 $samples = [Collections.Generic.List[object]]::new()
 $random = [Random]::new(2201)
-for ($round = 1; $round -le $Rounds; ++$round) {
-    $order = $variants.Clone()
-    if ($Mode -eq 'Sweep') {
-        for ($i = $order.Count - 1; $i -gt 0; --$i) {
-            $j = $random.Next($i + 1)
-            $order[$i], $order[$j] = $order[$j], $order[$i]
+try {
+    if ($ClientAffinityMask) { $controller.ProcessorAffinity = [IntPtr]::new([long]$ClientAffinityMask) }
+    for ($round = 1; $round -le $Rounds; ++$round) {
+        $order = $variants.Clone()
+        if ($Mode -eq 'Sweep') {
+            for ($i = $order.Count - 1; $i -gt 0; --$i) {
+                $j = $random.Next($i + 1)
+                $order[$i], $order[$j] = $order[$j], $order[$i]
+            }
+        } elseif ($order.Count -gt 1) {
+            $start = ($round - 1) % $order.Count
+            $order = for ($i = 0; $i -lt $variants.Count; ++$i) { $variants[($start + $i) % $variants.Count] }
         }
-    } elseif ($order.Count -gt 1) {
-        $start = ($round - 1) % $order.Count
-        $order = for ($i = 0; $i -lt $variants.Count; ++$i) { $variants[($start + $i) % $variants.Count] }
-    }
-    foreach ($variant in $order) {
-        try { $trial = Invoke-Trial $variant $round }
-        catch {
-            $failure = "Trial $round ($($variant.Label)) failed. $($_.Exception.Message)"
-            $failure | Set-Content -LiteralPath (Join-Path $output 'failure.txt')
-            throw $failure
+        foreach ($variant in $order) {
+            try { $trial = Invoke-Trial $variant $round }
+            catch {
+                $failure = "Trial $round ($($variant.Label)) failed. $($_.Exception.Message)"
+                $failure | Set-Content -LiteralPath (Join-Path $output 'failure.txt')
+                throw $failure
+            }
+            $samples.Add($trial)
+            $trial | ConvertTo-Json -Depth 8 -Compress | Add-Content -LiteralPath $jsonl
         }
-        $samples.Add($trial)
-        $trial | ConvertTo-Json -Depth 8 -Compress | Add-Content -LiteralPath $jsonl
     }
+} finally {
+    if ($ClientAffinityMask) { $controller.ProcessorAffinity = [IntPtr]::new([long]$originalAffinity) }
+    $controller.Dispose()
 }
 
-$measures = 'requests_per_second', 'p50_ms', 'p95_ms', 'p99_ms', 'cpu_cores', 'cpu_ms', 'private_bytes', 'context_switches'
+$measures = 'requests_per_second', 'p50_ms', 'p95_ms', 'p99_ms', 'cpu_cores', 'client_cpu_cores', 'cpu_ms', 'cpu_seconds_per_1000',
+    'requests_per_cpu_second', 'private_bytes', 'context_switches'
 $medians = [ordered]@{}
 foreach ($variant in $variants) {
     $group = @($samples | Where-Object variant -eq $variant.Label)
     $medians[$variant.Label] = [ordered]@{
         completed = Get-Median @($group.completed)
+        threads_after_warmup = Get-Median @($group.threads_after_warmup)
         rejected_connections = Get-Median @($group | ForEach-Object { $_.early_eof + $_.reset_10054 + $_.aborted_10053 })
     }
     foreach ($measure in $measures) {
@@ -200,7 +271,11 @@ if ($Mode -ne 'Sweep') {
                 $values = for ($k = 0; $k -lt $Rounds; ++$k) {
                     if ($base[$k][$measure] -gt 0) { 100 * ($new[$k][$measure] / $base[$k][$measure] - 1) }
                 }
-                if (@($values).Count -eq $Rounds) { $changes[$measure] = Get-PairedEstimate @($values) }
+                if (@($values).Count -eq $Rounds) {
+                    $change = Get-PairedEstimate @($values)
+                    $change.ratio_of_medians_pct = [Math]::Round(100 * ($medians[$newName][$measure] / $medians[$baseName][$measure] - 1), 3)
+                    $changes[$measure] = $change
+                }
             }
             $paired["$newName vs $baseName"] = $changes
         }
@@ -209,6 +284,7 @@ if ($Mode -ne 'Sweep') {
 [ordered]@{
     model_sha256 = (Get-FileHash -LiteralPath $modelPath).Hash; rounds = $Rounds; clients = $Clients
     connections_per_client = $ConnectionsPerClient; bursts_per_connection = $BurstsPerConnection
+    server_affinity_mask = $ServerAffinityMask; client_affinity_mask = $ClientAffinityMask
     variants = $variants; medians = $medians; paired_changes = $paired
 } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $output 'summary.json')
 Write-Output "Completed $($samples.Count) trials. Results are in $output."

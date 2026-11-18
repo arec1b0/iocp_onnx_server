@@ -50,6 +50,15 @@ public static class ReliabilityHarness
         IntPtr threadAttributes, bool inherit, uint flags, IntPtr environment, string directory,
         ref StartupInfo startup, out ProcessInfo information);
     [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool SetProcessAffinityMask(IntPtr process, UIntPtr mask);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern uint ResumeThread(IntPtr thread);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool TerminateProcess(IntPtr process, uint exitCode);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetSystemCpuSetInformation(byte[] buffer, uint length, out uint required,
+        IntPtr process, uint flags);
+    [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool CloseHandle(IntPtr handle);
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool GetExitCodeProcess(IntPtr process, out uint exitCode);
@@ -85,28 +94,51 @@ public static class ReliabilityHarness
         return handle;
     }
 
-    public static Process StartServer(string executable, string directory, string stdout, string stderr)
+    public static Process StartServer(string executable, string directory, string stdout, string stderr) =>
+        StartServer(executable, directory, stdout, stderr, 0);
+
+    public static Process StartServer(string executable, string directory, string stdout, string stderr, ulong affinityMask)
     {
         var output = OpenConsoleFile(stdout, false);
-        try { return StartServer(executable, directory, output, stderr); }
+        try { return StartServer(executable, directory, output, stderr, affinityMask); }
         finally { CloseHandle(output); }
     }
 
-    public static Process StartServer(string executable, string directory, IntPtr stdout, string stderr)
+    public static Process StartServer(string executable, string directory, IntPtr stdout, string stderr) =>
+        StartServer(executable, directory, stdout, stderr, 0);
+
+    private static Process StartServer(string executable, string directory, IntPtr stdout, string stderr, ulong affinityMask)
     {
         var startup = new StartupInfo { Size = Marshal.SizeOf<StartupInfo>(), Flags = 0x101, Output = stdout };
         try
         {
             startup.Input = OpenConsoleFile("NUL", true);
             startup.Error = OpenConsoleFile(stderr, false);
-            if (!CreateProcess(executable, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, true, 0x10,
+            const uint newConsole = 0x10;
+            const uint suspended = 0x04;
+            uint flags = newConsole | (affinityMask != 0 ? suspended : 0);
+            if (!CreateProcess(executable, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, true, flags,
                     IntPtr.Zero, directory, ref startup, out var info))
                 throw NativeError("Create isolated server console");
             try
             {
+                if (affinityMask != 0)
+                {
+                    // Apply the budget before the executable can create any worker or load ONNX Runtime.
+                    if (!SetProcessAffinityMask(info.Process, new UIntPtr(affinityMask)))
+                        throw NativeError("Set server processor affinity");
+                    uint suspendCount = ResumeThread(info.Thread);
+                    if (suspendCount == uint.MaxValue) throw NativeError("Resume pinned server");
+                    if (suspendCount != 1) throw new InvalidOperationException("Unexpected server suspend count.");
+                }
                 var process = Process.GetProcessById(info.ProcessId);
                 _ = process.Handle;
                 return process;
+            }
+            catch
+            {
+                TerminateProcess(info.Process, 1);
+                throw;
             }
             finally { CloseHandle(info.Thread); CloseHandle(info.Process); }
         }
@@ -115,6 +147,46 @@ public static class ReliabilityHarness
             if (startup.Input != IntPtr.Zero) CloseHandle(startup.Input);
             if (startup.Error != IntPtr.Zero) CloseHandle(startup.Error);
         }
+    }
+
+    public sealed class CpuSet
+    {
+        public ushort Group { get; init; }
+        public byte LogicalProcessor { get; init; }
+        public byte Core { get; init; }
+        public byte LastLevelCache { get; init; }
+        public byte NumaNode { get; init; }
+        public byte EfficiencyClass { get; init; }
+    }
+
+    public static CpuSet[] ReadCpuTopology()
+    {
+        using var process = Process.GetCurrentProcess();
+        GetSystemCpuSetInformation(null, 0, out uint length, process.Handle, 0);
+        if (length == 0) throw NativeError("Query CPU set buffer length");
+        var buffer = new byte[length];
+        if (!GetSystemCpuSetInformation(buffer, length, out length, process.Handle, 0))
+            throw NativeError("Query CPU sets");
+
+        var result = new List<CpuSet>();
+        for (int offset = 0; offset < length;)
+        {
+            if (length - offset < 8) throw new InvalidDataException("Incomplete CPU set record.");
+            int size = BitConverter.ToInt32(buffer, offset);
+            if (size < 8 || size > length - offset) throw new InvalidDataException("Invalid CPU set record size.");
+            // CPU_SET_INFORMATION_TYPE.CpuSetInformation is zero. Its prefix is stable in the Windows SDK.
+            if (size >= 20 && BitConverter.ToInt32(buffer, offset + 4) == 0)
+            {
+                result.Add(new CpuSet
+                {
+                    Group = BitConverter.ToUInt16(buffer, offset + 12), LogicalProcessor = buffer[offset + 14],
+                    Core = buffer[offset + 15], LastLevelCache = buffer[offset + 16], NumaNode = buffer[offset + 17],
+                    EfficiencyClass = buffer[offset + 18]
+                });
+            }
+            offset += size;
+        }
+        return result.ToArray();
     }
 
     public static uint InterruptServer(Process server, int timeoutMs)
@@ -149,6 +221,9 @@ public static class ReliabilityHarness
         if (!GetExitCodeProcess(server.Handle, out uint exitCode)) throw NativeError("Read server exit code");
         return exitCode;
     }
+
+    public static Task<uint> InterruptServerAsync(Process server, int timeoutMs) =>
+        Task.Run(() => InterruptServer(server, timeoutMs));
 
     public static Task<uint> FillStdoutPipe(IntPtr read, IntPtr write)
     {
@@ -335,6 +410,27 @@ public static class ReliabilityHarness
         BitConverter.GetBytes(10UL).CopyTo(request, 0);
         for (int i = 0; i < 10; ++i) BitConverter.GetBytes((float)(seed + i)).CopyTo(request, 8 + 4 * i);
         return request;
+    }
+
+    public static TcpClient BeginInference(int seed, int timeout)
+    {
+        var client = Connect(timeout);
+        try
+        {
+            client.SendTimeout = timeout;
+            client.GetStream().Write(Request(seed));
+            return client;
+        }
+        catch { client.Dispose(); throw; }
+    }
+
+    public static void VerifyInference(TcpClient client, int seed, int timeout)
+    {
+        var actual = new byte[FrameBytes];
+        var expected = new byte[FrameBytes];
+        Expected(expected, 1, seed);
+        ReceiveExact(client, actual, timeout, Stopwatch.StartNew());
+        if (!actual.AsSpan().SequenceEqual(expected)) throw new InvalidDataException("Incorrect inference reply.");
     }
 
     private static void Expected(byte[] output, int rows, int seed)

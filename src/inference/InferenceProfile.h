@@ -14,7 +14,7 @@ public:
         ClaimSocket, DispatchSocket, SweepSocket, ReceivePost, SendPost, Response, WorkerBusy, WorkerLifetime,
         CompletionWait, CompletionHold, HandoffWait, HandoffHold, ClaimWait, ClaimHold,
         DispatchWait, DispatchHold, SubmitResultWait, SubmitResultHold, EarlyCompletionWait,
-        AcceptWait, AcceptHold, SweepWait, SweepHold, PhaseCount
+        AcceptWait, AcceptHold, SweepWait, SweepHold, MetricsFormat, MetricsLockWait, MetricsAppendHold, PhaseCount
     };
 
     struct Duration {

@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Net;
 using System.Net.Sockets;
+using System.Text.Json;
 using System.Threading.Tasks;
 
 public static class ConnectionBenchmarkClient
@@ -11,7 +12,7 @@ public static class ConnectionBenchmarkClient
     private const int FrameBytes = 48;
     private const int TimeoutMs = 5000;
 
-    private static byte[] BuildBurst(int multiplier)
+    internal static byte[] BuildBurst(int multiplier)
     {
         var bytes = new byte[FramesPerBurst * FrameBytes];
         for (var frame = 0; frame < FramesPerBurst; ++frame)
@@ -145,5 +146,42 @@ public static class ConnectionBenchmarkClient
     {
         if (!response.AsSpan(0, count).SequenceEqual(expected.AsSpan(0, count)))
             throw new InvalidDataException("Benchmark response prefix was incorrect.");
+    }
+
+    public static void ValidateMetricsFile(string path, int expectedRecords, bool requireCompleteBursts = true)
+    {
+        if (expectedRecords < 0 || (requireCompleteBursts && (expectedRecords == 0 || expectedRecords % FramesPerBurst != 0)))
+            throw new ArgumentException("Expected complete benchmark bursts for JSONL reconciliation.");
+        using var file = File.OpenRead(path);
+        if (file.Length == 0 && expectedRecords == 0) return;
+        if (file.Length == 0 || file.Seek(-1, SeekOrigin.End) < 0 || file.ReadByte() != '\n')
+            throw new InvalidDataException("Metrics file ends in an incomplete record.");
+        file.Position = 0;
+        using var reader = new StreamReader(file);
+        var counts = new int[FramesPerBurst];
+        int records = 0;
+        while (reader.ReadLine() is string line)
+        {
+            using var document = JsonDocument.Parse(line);
+            var record = document.RootElement;
+            int fields = 0;
+            foreach (var field in record.EnumerateObject()) ++fields;
+            var latency = record.GetProperty("latency_ms").GetDouble();
+            var mean = record.GetProperty("input_mean").GetDouble();
+            var stddev = record.GetProperty("input_stddev").GetDouble();
+            var frame = (int)((mean + 0.5) / 10);
+            if (fields != 5 || record.GetProperty("timestamp").GetInt64() <= 0 ||
+                !double.IsFinite(latency) || latency < 0 || record.GetProperty("element_count").GetInt32() != 10 ||
+                frame < 0 || frame >= FramesPerBurst || mean != frame * 10 - 0.5 ||
+                !double.IsFinite(stddev) || Math.Abs(stddev - Math.Sqrt(8.25)) > 0.00001)
+                throw new InvalidDataException("Incorrect metrics record at line " + (records + 1));
+            ++counts[frame];
+            ++records;
+        }
+        if (records != expectedRecords) throw new InvalidDataException("Metrics record count did not reconcile.");
+        if (requireCompleteBursts)
+            foreach (int count in counts)
+                if (count != expectedRecords / FramesPerBurst)
+                    throw new InvalidDataException("Metrics input statistics did not reconcile with every benchmark frame.");
     }
 }

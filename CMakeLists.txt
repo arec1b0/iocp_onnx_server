@@ -64,11 +64,15 @@ if(BUILD_TESTING)
         ${IOCP_SOURCES}
     )
     add_executable(logger_tests tests/LoggerTests.cpp src/utils/Logger.cpp)
+    add_executable(metrics_tests tests/MetricsTests.cpp src/utils/Metrics.cpp src/utils/Logger.cpp
+        src/inference/InferenceProfile.cpp)
+    target_compile_definitions(metrics_tests PRIVATE IOCP_TEST_METRICS)
     target_compile_definitions(logger_tests PRIVATE IOCP_TEST_LOG_WRITES)
     target_link_libraries(iocp_lifecycle_tests PRIVATE onecore)
     target_link_libraries(buffered_pipelining_tests PRIVATE onecore)
     target_link_libraries(logger_tests PRIVATE onecore)
-    set_target_properties(protocol_tests send_completion_tests iocp_lifecycle_tests buffered_pipelining_tests logger_tests
+    target_link_libraries(metrics_tests PRIVATE onecore)
+    set_target_properties(protocol_tests send_completion_tests iocp_lifecycle_tests buffered_pipelining_tests logger_tests metrics_tests
         PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests"
     )
     add_test(NAME protocol_framing COMMAND protocol_tests)
@@ -81,6 +85,13 @@ if(BUILD_TESTING)
     add_test(NAME stdout_broken_partial_record COMMAND logger_tests broken)
     add_test(NAME stdout_concurrent_pressure COMMAND logger_tests pressure)
     add_test(NAME stdout_loss_unreportable COMMAND logger_tests unavailable)
+    add_test(NAME inference_metrics_records COMMAND metrics_tests)
+    add_test(NAME inference_metrics_faults COMMAND metrics_tests faults)
+    foreach(test IN ITEMS buffered_pipelining_state iocp_lifecycle connection_policies inference_scheduler)
+        file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/${test}")
+        set_tests_properties(${test} PROPERTIES WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/${test}")
+    endforeach()
+    set_tests_properties(inference_metrics_records inference_metrics_faults PROPERTIES LABELS logging TIMEOUT 15)
     set_tests_properties(iocp_lifecycle connection_policies inference_scheduler PROPERTIES LABELS network TIMEOUT 90)
     set_tests_properties(stdout_slow_reader stdout_broken_partial_record stdout_concurrent_pressure stdout_loss_unreportable
         PROPERTIES LABELS logging TIMEOUT 10)

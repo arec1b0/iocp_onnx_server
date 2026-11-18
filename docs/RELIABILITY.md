@@ -159,6 +159,146 @@ pwsh -NoProfile -NonInteractive -Command '& ./tests/InferenceSchedulerBenchmark.
 
 Use a fresh output directory for each invocation. The sweep uses a fixed random seed to vary run order. `trials.jsonl` contains the raw samples, and `summary.json` includes medians and paired bootstrap intervals for comparisons. The dense model expands each request into repeated rows and runs six dense matrix multiplications with an exact `y = 2x` output for the benchmark's integer inputs. It is a synthetic CPU workload. Under capacity-one pressure, latency percentiles describe completed replies. The harness validates each returned response and reconciles connection failures against the server's rejection counter before reporting the trial. The gated `inference_scheduler` CTest also measures loopback network probes while a callback is blocked and the queue is full.
 
+## Fixed CPU budget and inference metrics sink
+
+Run each experiment in its own PowerShell 7 process with port 8080 free. The launcher creates the server suspended, sets its Windows process affinity mask, then resumes it. The benchmark checks the mask after warmup and after measurement. This limits all server threads, including runtime-created threads, to the specified logical processors. Other host processes can share those CPUs, and kernel networking work can run elsewhere. The client uses a separate, constant mask.
+
+These masks describe the Stage 2.3 host. Group 0 exposed 16 logical processors. The nested server sets were `1–2`, `1–4`, and `1–8`, all from efficiency class 0 and separate exposed cores. The client used `0, 9–13`. On another host, inspect topology first and select disjoint masks. Worker pool sizes are independent of the masks. The server creates its default IOCP pool and the benchmark sets eight inference workers on scheduler builds. The model uses the CPU provider, one intra-op thread, and the default sequential execution mode.
+
+```powershell
+Add-Type -Path tests/ReliabilityHarness.cs
+[ReliabilityHarness]::ReadCpuTopology() | Format-Table
+
+$evidence = 'build/stage23-evidence'
+New-Item -ItemType Directory -Force $evidence | Out-Null
+uv run --no-project --python 3.12 --with 'onnx==1.22.0' python tests/generate_scheduler_model.py "$evidence/dense512.onnx" --width 512
+$binaries = @{
+    Stage1Exe = 'build/stage21-baseline/Release/iocp_onnx_server.exe'
+    ReferenceExe = 'build/stage21-release/Release/iocp_onnx_server.exe'
+    CandidateExe = 'build/stage22-release/Release/iocp_onnx_server.exe'
+}
+$workloads = @(
+    @{Name='trivial'; Model='models/model.onnx'; Bursts=48},
+    @{Name='dense256'; Model='build/stage22-dense.onnx'; Bursts=24},
+    @{Name='dense512'; Model="$evidence/dense512.onnx"; Bursts=8}
+)
+$masks = @{2=6; 4=30; 8=510}
+foreach ($cpu in 2,4,8) {
+    foreach ($workload in $workloads) {
+        pwsh -NoProfile -NonInteractive -File tests/InferenceSchedulerBenchmark.ps1 `
+            -Stage1Exe $binaries.Stage1Exe -ReferenceExe $binaries.ReferenceExe -CandidateExe $binaries.CandidateExe `
+            -CandidateLabel stage22 -Model $workload.Model -OutputDirectory "$evidence/$($workload.Name)-cpu$cpu" `
+            -Rounds 15 -ConnectionsPerClient 2 -BurstsPerConnection $workload.Bursts `
+            -ServerAffinityMask $masks[$cpu] -ClientAffinityMask 15873
+        if ($LASTEXITCODE -ne 0) { throw 'Fixed affinity benchmark failed.' }
+    }
+}
+```
+
+The baseline builds use `8149ffdea3c885ef2d47f544b98c5bb4e3daeaa0`, `fb7c8f342a3734b59eaf99ddb291f31c1f17b676`, and `becab75bb6cdfd4aef31c8206b1abaae875a69dc`, respectively, with the same MSVC Release flags and ONNX Runtime 1.18.1. The existing generator reproduces the width-256 artifact with `--width 256`. Both dense models run six dense matrix multiplications and preserve the `[1, 10]` float32 wire shape and checked `y = 2x` result. CPU efficiency uses the server's user plus kernel CPU time charged to the process around the measured requests. Private bytes are an end-of-trial sample. Client CPU is recorded independently. Report both the ratio of medians and the median of same-round changes. The intervals are paired bootstrap intervals. Separate `-ProfileBoth` trials collect instrumented timings. Callback wall time includes ONNX setup and preemption, and worker utilization includes time waiting for registry or sink locks.
+
+```powershell
+foreach ($cpu in 2,4,8) {
+    foreach ($workload in $workloads) {
+        pwsh -NoProfile -NonInteractive -File tests/InferenceSchedulerBenchmark.ps1 `
+            -CandidateExe $binaries.CandidateExe -CandidateLabel stage22 -ProfileBoth `
+            -Model $workload.Model -OutputDirectory "$evidence/profile-$($workload.Name)-cpu$cpu" `
+            -Rounds 5 -ConnectionsPerClient 2 -BurstsPerConnection $workload.Bursts `
+            -ServerAffinityMask $masks[$cpu] -ClientAffinityMask 15873
+        if ($LASTEXITCODE -ne 0) { throw 'Scheduler profile failed.' }
+    }
+}
+pwsh -NoProfile -NonInteractive -File tests/InferenceSchedulerBenchmark.ps1 `
+    -CandidateExe $binaries.CandidateExe -CandidateLabel workers8 -Workers 8 `
+    -ReferenceExe $binaries.CandidateExe -ReferenceLabel workers2 -ReferenceWorkers 2 `
+    -Model build/stage22-dense.onnx -Rounds 15 -ConnectionsPerClient 2 -BurstsPerConnection 24 `
+    -ServerAffinityMask 6 -ClientAffinityMask 15873 -OutputDirectory "$evidence/dense256-cpu2-worker-comparison"
+pwsh -NoProfile -NonInteractive -File tests/InferenceSchedulerBenchmark.ps1 `
+    -CandidateExe $binaries.CandidateExe -CandidateLabel workers2 -Workers 2 -ProfileBoth `
+    -Model build/stage22-dense.onnx -Rounds 5 -ConnectionsPerClient 2 -BurstsPerConnection 24 `
+    -ServerAffinityMask 6 -ClientAffinityMask 15873 -OutputDirectory "$evidence/profile-dense256-cpu2-workers2"
+```
+
+The optional handoff comparison uses the surviving Stage 2.2 diagnostic build of the original scheduler at `build/stage22-profile/Release/iocp_onnx_server.exe`. For each workload, repeat the four-processor profile with this executable as `-ReferenceExe`, label it `stage21-profiled`, and label the candidate `stage22-profiled`. These exploratory phase samples stay separate from the uninstrumented comparisons of the three committed revisions.
+
+The sink experiment compiles a diagnostic replacement for `Metrics.cpp` in an archived Stage 2.2 tree. It compares ordinary buffered JSONL, the Windows `NUL` device, formatting into a discard stream, and bypassing the sink. The alternate sinks are deliberate benchmark controls. Use the ordinary server executable for deployment. In the file arm the harness checks that the number of complete records matches completed requests. Add `-SplitMetrics -ProfileBoth` in a separate run to time mutex acquisition, stream insertion, and close. The stream timing includes formatting and buffering. Close timing ends when the C++ stream closes. Durable media completion requires separate measurement.
+
+```powershell
+./tests/BuildMetricsSinkProbe.ps1 -OnnxRuntimeDir build/stage173-deps/onnxruntime-win-x64 `
+    -OutputDirectory build/stage23-metrics-probe
+$probe = 'build/stage23-metrics-probe/build/Release/iocp_onnx_server.exe'
+$sinkCases = @(
+    @{Name='trivial-w1'; Model='models/model.onnx'; Bursts=48; Workers=1},
+    @{Name='trivial-w8'; Model='models/model.onnx'; Bursts=48; Workers=8},
+    @{Name='dense256-w8'; Model='build/stage22-dense.onnx'; Bursts=24; Workers=8},
+    @{Name='dense512-w8'; Model="$evidence/dense512.onnx"; Bursts=8; Workers=8}
+)
+foreach ($case in $sinkCases) {
+    pwsh -NoProfile -NonInteractive -File tests/InferenceSchedulerBenchmark.ps1 `
+        -Mode MetricsSink -CandidateExe $probe -Workers $case.Workers -Model $case.Model `
+        -Rounds 15 -ConnectionsPerClient 2 -BurstsPerConnection $case.Bursts `
+        -ServerAffinityMask 30 -ClientAffinityMask 15873 -OutputDirectory "$evidence/metrics-$($case.Name)"
+    if ($LASTEXITCODE -ne 0) { throw 'Metrics sink comparison failed.' }
+    pwsh -NoProfile -NonInteractive -File tests/InferenceSchedulerBenchmark.ps1 `
+        -Mode MetricsSink -CandidateExe $probe -Workers $case.Workers -Model $case.Model -SplitMetrics -ProfileBoth `
+        -Rounds 5 -ConnectionsPerClient 2 -BurstsPerConnection $case.Bursts `
+        -ServerAffinityMask 30 -ClientAffinityMask 15873 -OutputDirectory "$evidence/split-$($case.Name)"
+    if ($LASTEXITCODE -ne 0) { throw 'Metrics sink profile failed.' }
+}
+```
+
+## Metrics optimization and worker recommendations
+
+Use the exact Stage 2.3 Release executable as the original sink, the Stage 2.4 Release executable as the optimized sink, and the archived Stage 2.3 probe for diagnostic bypass. The three arms are interleaved for 15 rounds per model on four logical processors with eight inference workers. Bypass belongs to the diagnostic build. The ordinary executable always attempts metrics delivery. The driver validates exact ordered responses, every JSONL field, the input-statistics histogram and the record count after clean shutdown. The bypass arm checks that the metrics file is absent.
+
+The original sink can also be rebuilt from `becab75bb6cdfd4aef31c8206b1abaae875a69dc` because the accepted Stage 2.3 source changes affect tests and diagnostics. Use fresh output paths and the same extracted ONNX Runtime 1.18.1 distribution as the optimized build.
+
+```powershell
+$ort = (Resolve-Path build/stage173-deps/onnxruntime-win-x64).Path
+$repro = "build/stage24-reference-$PID"
+New-Item -ItemType Directory $repro | Out-Null
+git archive --format=zip --output "$repro/source.zip" becab75bb6cdfd4aef31c8206b1abaae875a69dc
+Expand-Archive -LiteralPath "$repro/source.zip" -DestinationPath "$repro/source"
+cmake -S "$repro/source" -B "$repro/baseline" -G 'Visual Studio 17 2022' -A x64 "-DONNXRUNTIME_DIR=$ort"
+cmake --build "$repro/baseline" --config Release --target iocp_onnx_server --parallel 1 -- /nr:false
+./tests/BuildMetricsSinkProbe.ps1 -OnnxRuntimeDir $ort -OutputDirectory "$repro/probe"
+uv run --no-project --python 3.12 --with 'onnx==1.22.0' python tests/generate_scheduler_model.py "$repro/dense256.onnx" --width 256
+uv run --no-project --python 3.12 --with 'onnx==1.22.0' python tests/generate_scheduler_model.py "$repro/dense512.onnx" --width 512
+```
+
+For this layout, pass `-BaselineExe "$repro/baseline/Release/iocp_onnx_server.exe"`, `-BypassExe "$repro/probe/build/Release/iocp_onnx_server.exe"`, `-Dense256 "$repro/dense256.onnx"`, and `-Dense512 "$repro/dense512.onnx"` to the study.
+
+The driver also tests one, two, four and eight inference workers on each CPU mask and model. It uses 15 randomized rounds per configuration for latency, throughput and CPU measurements and a separate three-round sweep for internal profiling. The profiler exposes `metrics_format`, `metrics_lock_wait`, and `metrics_append_hold` as per-worker wall-clock spans. Registry acquisition and hold spans, queue depth and wait, and worker busy time are reported separately. Use the masks from the fixed CPU budget experiment or supply equivalent disjoint masks for another host.
+
+```powershell
+$baseline = 'build/stage23-release/Release/iocp_onnx_server.exe'
+$optimized = 'build/stage24-release/Release/iocp_onnx_server.exe'
+$bypass = 'build/stage23-metrics-probe/build/Release/iocp_onnx_server.exe'
+pwsh -NoProfile -NonInteractive -File tests/MetricsOptimizationStudy.ps1 `
+    -BaselineExe $baseline -OptimizedExe $optimized -BypassExe $bypass `
+    -OutputDirectory build/stage24-evidence -Rounds 15 -ProfileRounds 3 `
+    -Cpu2Mask 6 -Cpu4Mask 30 -Cpu8Mask 510 -ClientMask 15873
+```
+
+`comparison-*/trials.jsonl` keeps the three-arm samples and `summary.json` contains the paired intervals. `workers-*` holds unprofiled measured samples. `profiles-*` holds internal timing samples. The script writes `worker-results.json` with p50/p95/p99, CPU cost, queue and lock timings, worker utilization, and a Pareto flag. The Pareto comparison maximizes median successful throughput and minimizes median p50, p99, and CPU cost. `worker-recommendations.csv` selects the highest observed median throughput among healthy configurations with bounded queue depth. Its illustrative tail policy selects the lowest p99 among configurations delivering at least 95% of that throughput. This relative threshold is a benchmark assumption. Sustainable open-loop capacity and production SLOs require separate validation.
+
+The independent Dense256 replication uses the same affinity, workload and rotation in a fresh output directory.
+
+```powershell
+pwsh -NoProfile -NonInteractive -File tests/InferenceSchedulerBenchmark.ps1 `
+    -Mode MetricsOptimization -ReferenceExe $baseline -CandidateExe $optimized -BypassExe $bypass `
+    -Model build/stage22-dense.onnx -Rounds 15 -Workers 8 -ConnectionsPerClient 2 -BurstsPerConnection 24 `
+    -ServerAffinityMask 30 -ClientAffinityMask 15873 -OutputDirectory "build/stage24-dense256-replay-$PID"
+```
+
+The metrics fault CTest uses a short-writing stream buffer with simulated `ENOSPC`, an injected stream flush failure, and an injected close fail state. It runs concurrent producers after the short-write trigger and reconciles their counters. The real-file cases exercise a directory at the output path, a preexisting partial tail, and normal concurrent append. The loopback failure smoke uses the ordinary server executable and verifies exact inference replies, status 4, the failure report, and network drain. It leaves the real volume capacity untouched.
+
+```powershell
+ctest --test-dir build/stage24-release -C Release -R 'inference_metrics|^inference_scheduler$' -V
+pwsh -NoProfile -NonInteractive -File tests/MetricsFailureSmoke.ps1 `
+    -ServerExe $optimized -OutputDirectory "build/stage24-metrics-failure-$PID"
+```
+
 ## Host churn investigation
 
 Run one experiment at a time with port 8080 free. Experiment C is the only case that starts a competing workload. It overlaps the original 45-second mixed smoke with three iterations of the existing ephemeral-loopback lifecycle suite. Experiments B, D, and E use the shipped model and 100 verified requests per phase. B increases the paced connection rate from 5 to 20 to 40 per second. D uses 5 per second throughout. E reuses one connection per phase at B's request pacing. F fills eight registered slots, checks one capacity rejection, verifies the holders still get exact replies, and then checks idle and incomplete-frame expiration.

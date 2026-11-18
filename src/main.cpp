@@ -1,11 +1,13 @@
 #include "utils/Config.h"
 #include "utils/Logger.h"
+#include "utils/Metrics.h"
 #include "inference/OnnxModel.h"
 #include "server/IocpServer.h"
 #include <csignal>
 #include <atomic>
 #include <thread>
 #include <chrono>
+#include <cstdio>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -20,6 +22,21 @@ void SignalHandler(int) {
 
 namespace {
     constexpr auto ConnectionMetricsInterval = std::chrono::seconds(30);
+    constexpr int MetricsDeliveryFailed = 4;
+
+    void ReportInferenceDeliveryFailure(const Metrics::Delivery& delivery) {
+        char message[512];
+        const auto size = std::snprintf(message, sizeof(message),
+            "{\"event\":\"inference_metrics_delivery_failed\",\"appended\":%llu,\"flushed\":%llu,"
+            "\"unconfirmed\":%llu,\"rejected\":%llu,\"write_failures\":%llu,\"skipped\":%llu,"
+            "\"open_failed\":%s,\"flush_failed\":%s,\"close_failed\":%s}",
+            static_cast<unsigned long long>(delivery.appended), static_cast<unsigned long long>(delivery.flushed),
+            static_cast<unsigned long long>(delivery.appended - delivery.flushed),
+            static_cast<unsigned long long>(delivery.rejected), static_cast<unsigned long long>(delivery.writeFailures),
+            static_cast<unsigned long long>(delivery.skipped), delivery.openFailed ? "true" : "false",
+            delivery.flushFailed ? "true" : "false", delivery.closeFailed ? "true" : "false");
+        if (size > 0 && static_cast<std::size_t>(size) < sizeof(message)) LOG_ERR(message);
+    }
 
     std::string SerializeConnectionMetrics(const IocpServer& server, const char* phase) {
         const auto snapshot = server.GetConnectionMetrics();
@@ -70,6 +87,7 @@ static int RunServer(std::string& finalMetrics) {
         LOG_ERR("Failed to start server.");
         return 1;
     }
+    auto& metrics = Metrics::GetInstance();
 
     Logger::WriteJsonLine(SerializeConnectionMetrics(server, "running"));
     auto nextReport = IocpServer::Clock::now() + ConnectionMetricsInterval;
@@ -83,11 +101,16 @@ static int RunServer(std::string& finalMetrics) {
     }
 
     server.Stop();
+    const auto delivery = metrics.Close();
     finalMetrics = SerializeConnectionMetrics(server, "stopped");
     if (trace && !trace->Save()) LOG_ERR("Could not save connection-trace.jsonl.");
     if (profile && !profile->Save()) LOG_ERR("Could not save inference-profile.json.");
-    LOG_INFO("Application terminated gracefully.");
-    return 0;
+    if (delivery.Complete()) {
+        LOG_INFO("Application terminated gracefully.");
+        return 0;
+    }
+    ReportInferenceDeliveryFailure(delivery);
+    return MetricsDeliveryFailed;
 }
 
 int main() {

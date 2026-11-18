@@ -64,7 +64,7 @@ bool InferenceProfile::Save() const {
         "worker_lifetime",
         "completion_wait", "completion_hold", "handoff_wait", "handoff_hold", "claim_wait", "claim_hold",
         "dispatch_wait", "dispatch_hold", "submit_result_wait", "submit_result_hold", "early_completion_wait",
-        "accept_wait", "accept_hold", "sweep_wait", "sweep_hold"
+        "accept_wait", "accept_hold", "sweep_wait", "sweep_hold", "metrics_format", "metrics_lock_wait", "metrics_append_hold"
     };
     static_assert(names.size() == PhaseCount);
     std::ofstream output("inference-profile.json", std::ios::trunc);

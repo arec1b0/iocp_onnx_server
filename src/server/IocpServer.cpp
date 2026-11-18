@@ -718,7 +718,7 @@ void IocpServer::DispatchResponse(Connection* conn, IOContext* response, Inferen
 
     const int error = SubmitSocketOperation(socket, *response, profile);
 #ifdef IOCP_TEST_SEND_SUBMISSION
-    if (afterSendSubmission_) afterSendSubmission_();
+    if (afterSendSubmission_) afterSendSubmission_(error);
 #endif
 
     InferenceProfile::RegistryLock registry(registryMutex_, profile, InferenceProfile::SubmitResultWait,
@@ -763,6 +763,6 @@ std::vector<float> IocpServer::RunInference(const std::vector<float>& inputTenso
     }
 
     InferenceStats stats{latency, mean, stddev, inputTensor.size()};
-    Metrics::GetInstance().RecordInference(stats);
+    Metrics::GetInstance().RecordInference(stats, profile);
     return outputTensor;
 }

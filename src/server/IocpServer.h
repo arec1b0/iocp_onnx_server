@@ -129,7 +129,7 @@ private:
     int failWorkerLaunchAt_ = -1;
 #endif
 #ifdef IOCP_TEST_SEND_SUBMISSION
-    std::function<void()> afterSendSubmission_;
+    std::function<void(int)> afterSendSubmission_;
 #endif
     const std::size_t inputElements_;
     const Inference inference_;

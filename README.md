@@ -9,7 +9,7 @@ The server accepts raw `float32` tensors over a custom binary TCP protocol, runs
 - **IOCP-based networking** — overlapped (asynchronous) TCP sockets multiplexed onto a completion port, serviced by a pool of worker threads matched to hardware concurrency.
 - **Zero-copy inference** — input and output buffers are bound directly to ONNX Runtime tensors via `Ort::Value::CreateTensor`, avoiding intermediate tensor allocations.
 - **TCP fragmentation handling** — a per-connection accumulation buffer with a header/payload state machine correctly reassembles requests split across arbitrary packet boundaries.
-- **Built-in observability** — every inference is recorded to `metrics.jsonl` (latency, input mean/stddev, element count), enabling latency tracking and input data drift detection.
+- **Built-in observability** — per-inference metrics in `metrics.jsonl` support latency and input drift tracking. The server reports incomplete delivery.
 - **Graceful shutdown** — `SIGINT`/`SIGTERM` handling with orderly teardown of the accept thread, worker pool, and completion port.
 - **CI pipeline** — GitHub Actions workflow that downloads ONNX Runtime, builds the project with MSVC, and uploads release artifacts.
 
@@ -195,7 +195,7 @@ seconds, and after graceful shutdown. See the
 [metric definitions](docs/ARCHITECTURE.md#connection-metrics) for the
 accounting rules.
 
-Every inference appends one JSON line to `metrics.jsonl` in the working directory:
+The server writes one JSONL record per inference to `metrics.jsonl` in the working directory. It reports unavailable or incomplete file delivery and continues serving inference. See [inference metrics](docs/ARCHITECTURE.md#inference-metrics) for delivery and exit-status semantics.
 
 ```json
 {"timestamp":1751970000000,"latency_ms":0.042,"input_mean":0.51,"input_stddev":0.29,"element_count":10}
