@@ -49,11 +49,13 @@ std::optional<Config> Config::Load() {
     const auto interval = ReadOverride("IOCP_ONNX_TIMEOUT_CHECK_INTERVAL_MS",
                                        static_cast<std::uint32_t>(defaults.checkInterval.count()),
                                        1, ConnectionLimits::MaxCheckIntervalMs);
-    if (!payload || !connections || !idle || !frame || !interval) {
+    const auto trace = ReadOverride("IOCP_ONNX_CONNECTION_TRACE", 0, 0, 1);
+    if (!payload || !connections || !idle || !frame || !interval || !trace) {
         return std::nullopt;
     }
     using std::chrono::milliseconds;
     config.maxPayloadBytes = *payload;
     config.connectionLimits = {*connections, milliseconds(*idle), milliseconds(*frame), milliseconds(*interval)};
+    config.connectionTrace = *trace != 0;
     return config;
 }

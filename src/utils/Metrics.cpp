@@ -1,7 +1,7 @@
 #include "Metrics.h"
+#include "Logger.h"
 #include <chrono>
 #include <cmath>
-#include <iostream>
 
 Metrics& Metrics::GetInstance() {
     static Metrics instance;
@@ -11,7 +11,7 @@ Metrics& Metrics::GetInstance() {
 Metrics::Metrics() {
     logFile_.open("metrics.jsonl", std::ios::app);
     if (!logFile_.is_open()) {
-        std::cerr << "[ERROR] Failed to open metrics.jsonl for writing.\n";
+        LOG_ERR("Failed to open metrics.jsonl for writing.");
     }
 }
 

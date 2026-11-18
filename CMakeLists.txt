@@ -8,7 +8,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 link_libraries(ws2_32 mswsock)
 
 # Direct paths for manually extracted ONNX Runtime
-set(ONNXRUNTIME_DIR "C:/onnxruntime")
+set(ONNXRUNTIME_DIR "C:/onnxruntime" CACHE PATH "Extracted ONNX Runtime distribution")
 include_directories(src ${ONNXRUNTIME_DIR}/include)
 
 set(IOCP_SOURCES
@@ -28,7 +28,7 @@ set(SOURCES
 )
 
 add_executable(${PROJECT_NAME} ${SOURCES})
-target_link_libraries(${PROJECT_NAME} PRIVATE "${ONNXRUNTIME_DIR}/lib/onnxruntime.lib")
+target_link_libraries(${PROJECT_NAME} PRIVATE onecore "${ONNXRUNTIME_DIR}/lib/onnxruntime.lib")
 
 # Auto-copy all ONNX Runtime DLLs to the output directory
 file(GLOB ORT_DLLS "${ONNXRUNTIME_DIR}/lib/*.dll")
@@ -57,11 +57,17 @@ if(BUILD_TESTING)
         tests/IocpLifecycleTests.cpp
         ${IOCP_SOURCES}
     )
+    target_compile_definitions(iocp_lifecycle_tests PRIVATE IOCP_TEST_THREAD_FAILURE)
     add_executable(buffered_pipelining_tests
         tests/BufferedPipeliningTests.cpp
         ${IOCP_SOURCES}
     )
-    set_target_properties(protocol_tests send_completion_tests iocp_lifecycle_tests buffered_pipelining_tests
+    add_executable(logger_tests tests/LoggerTests.cpp src/utils/Logger.cpp)
+    target_compile_definitions(logger_tests PRIVATE IOCP_TEST_LOG_WRITES)
+    target_link_libraries(iocp_lifecycle_tests PRIVATE onecore)
+    target_link_libraries(buffered_pipelining_tests PRIVATE onecore)
+    target_link_libraries(logger_tests PRIVATE onecore)
+    set_target_properties(protocol_tests send_completion_tests iocp_lifecycle_tests buffered_pipelining_tests logger_tests
         PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/tests"
     )
     add_test(NAME protocol_framing COMMAND protocol_tests)
@@ -69,5 +75,11 @@ if(BUILD_TESTING)
     add_test(NAME buffered_pipelining_state COMMAND buffered_pipelining_tests)
     add_test(NAME iocp_lifecycle COMMAND iocp_lifecycle_tests)
     add_test(NAME connection_policies COMMAND iocp_lifecycle_tests --connection-policies)
+    add_test(NAME stdout_slow_reader COMMAND logger_tests slow)
+    add_test(NAME stdout_broken_partial_record COMMAND logger_tests broken)
+    add_test(NAME stdout_concurrent_pressure COMMAND logger_tests pressure)
+    add_test(NAME stdout_loss_unreportable COMMAND logger_tests unavailable)
     set_tests_properties(iocp_lifecycle connection_policies PROPERTIES LABELS network TIMEOUT 90)
+    set_tests_properties(stdout_slow_reader stdout_broken_partial_record stdout_concurrent_pressure stdout_loss_unreportable
+        PROPERTIES LABELS logging TIMEOUT 10)
 endif()

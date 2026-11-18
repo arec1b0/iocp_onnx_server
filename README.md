@@ -162,6 +162,9 @@ ctest --test-dir build -C Release --output-on-failure
 ./tests/ProtocolSmoke.ps1 -ServerExe build/Release/iocp_onnx_server.exe
 ```
 
+See [reliability validation](docs/RELIABILITY.md) for the mixed-client soak,
+fault tests, and paired performance benchmark.
+
 With the server running, the Python clients can also exercise inference.
 
 ```bat
@@ -178,6 +181,12 @@ uv run scripts\analyze_metrics.py
 
 ## Observability
 
+The server emits aggregate admission, timeout, cancellation, and lifecycle
+metrics as `connection_metrics` JSON lines on stdout at startup, every 30
+seconds, and after graceful shutdown. See the
+[metric definitions](docs/ARCHITECTURE.md#connection-metrics) for the
+accounting rules.
+
 Every inference appends one JSON line to `metrics.jsonl` in the working directory:
 
 ```json
@@ -192,8 +201,9 @@ Every inference appends one JSON line to `metrics.jsonl` in the working director
 ## CI
 
 The [Windows CI workflow](.github/workflows/ci.yml) runs on pushes and pull
-requests to `master`. It provisions ONNX Runtime 1.18.1, builds with
-CMake/MSVC, runs the protocol and IOCP lifecycle tests, and uploads the Release build.
+requests to `master`. It provisions ONNX Runtime 1.18.1 and runs all CTest
+suites and the TCP smoke test with MSVC x64 Release and AddressSanitizer builds.
+It uploads build and test diagnostics and the Release binary.
 
 ## Known Limitations
 

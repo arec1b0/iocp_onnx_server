@@ -2,8 +2,15 @@
 #include "TensorUtils.h"
 #include "utils/Logger.h"
 
+namespace {
+    void ORT_API_CALL LogRuntime(void*, OrtLoggingLevel level, const char*, const char*, const char*,
+                                 const char* message) {
+        Logger::Log(level >= ORT_LOGGING_LEVEL_ERROR ? LogLevel::ERR : LogLevel::WARNING, message);
+    }
+}
+
 OnnxModel::OnnxModel() 
-    : env(ORT_LOGGING_LEVEL_WARNING, "IOCP_ONNX_Server"),
+    : env(ORT_LOGGING_LEVEL_WARNING, "IOCP_ONNX_Server", LogRuntime, nullptr),
       session(nullptr),
       memoryInfo(Ort::MemoryInfo::CreateCpu(OrtDeviceAllocator, OrtMemTypeCPU)) {}
 

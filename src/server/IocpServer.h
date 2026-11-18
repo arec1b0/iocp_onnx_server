@@ -12,6 +12,8 @@
 #include <unordered_map>
 #include "Connection.h"
 #include "ConnectionLimits.h"
+#include "ConnectionMetrics.h"
+#include "ConnectionTrace.h"
 
 /// Asynchronous TCP inference server built on Windows I/O Completion Ports.
 ///
@@ -28,7 +30,8 @@ public:
 
     /// The clock must be monotonic and safe to call from multiple threads.
     IocpServer(const std::string& ipAddress, int port, int workerThreads,
-               std::size_t inputElements, Inference inference, ConnectionLimits limits = {}, Now now = Clock::now);
+               std::size_t inputElements, Inference inference, ConnectionLimits limits = {}, Now now = Clock::now,
+               ConnectionTrace* trace = nullptr);
 
     /// Stops the server if still running.
     ~IocpServer();
@@ -43,6 +46,8 @@ public:
     void Stop();
     /// Returns the bound port while started, including an OS-assigned port.
     int BoundPort() const;
+    /// Copies all gauges and counters at one registry-lock boundary.
+    ConnectionMetricsSnapshot GetConnectionMetrics() const;
 
 private:
     friend struct IocpServerTestAccess;
@@ -52,6 +57,7 @@ private:
         IOContext* pending = nullptr;
         Clock::time_point deadline{};
         bool receivingFrame = false;
+        ConnectionTrace::Peer peer;
     };
     using ConnectionRegistry = std::unordered_map<Connection*, ActiveConnection>;
 
@@ -59,13 +65,17 @@ private:
     void StopLocked();
     void WorkerThread();
     void AcceptThread();
-    void Admit(SocketHandle socket);
-    void ProcessPacket(Connection* conn, OVERLAPPED* overlapped, bool succeeded, DWORD bytesTransferred);
+    void Admit(SocketHandle socket, const sockaddr_in* remote = nullptr);
+    void ProcessPacket(Connection* conn, OVERLAPPED* overlapped, DWORD error, DWORD bytesTransferred);
     IOContext* HandleCompletion(Connection& conn, IOOperation operation, DWORD bytesTransferred);
 
     // These require the registry lock. A reserved operation pins its entry
     // until the worker dequeues the completion or posting fails immediately.
     bool PostLocked(ActiveConnection& active, IOContext& context, Clock::time_point observedAt);
+    bool CloseActiveSocketLocked(ActiveConnection& active);
+    void RecordTimeoutLocked(const ActiveConnection& active, IOOperation operation, const char* phase, DWORD bytes = 0);
+    void TraceLocked(ConnectionTrace::Peer peer, const char* event, const char* phase, const char* operation,
+                     DWORD code = 0, DWORD bytes = 0) const noexcept;
     void CloseExpiredLocked(Clock::time_point now);
     void RetireLocked(ConnectionRegistry::iterator entry);
 
@@ -79,14 +89,19 @@ private:
 
     std::vector<std::thread> workers_;
     std::thread acceptThread_;
+#ifdef IOCP_TEST_THREAD_FAILURE
+    int failWorkerLaunchAt_ = -1;
+#endif
     const std::size_t inputElements_;
     const Inference inference_;
     const ConnectionLimits limits_;
     const Now now_;
+    ConnectionTrace* const trace_;
 
     mutable std::mutex lifecycleMutex_;
     std::atomic<bool> stopping_{true};
-    std::mutex registryMutex_;
+    mutable std::mutex registryMutex_;
     std::condition_variable registryDrained_;
     ConnectionRegistry connections_;
+    ConnectionMetricsSnapshot connectionMetrics_;
 };

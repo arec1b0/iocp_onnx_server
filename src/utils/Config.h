@@ -13,6 +13,7 @@ struct Config {
     int workerThreads;       ///< IOCP worker pool size.
     std::uint32_t maxPayloadBytes;  ///< Limit for each float32 payload.
     ConnectionLimits connectionLimits;
+    bool connectionTrace;
 
     /// Returns the default configuration: models/model.onnx, 0.0.0.0:8080,
     /// worker count = hardware_concurrency (fallback 2), a 16 MiB

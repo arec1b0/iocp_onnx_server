@@ -104,6 +104,35 @@ Model loading computes both element counts with checked multiplication and verif
 
 ## Observability
 
+### Connection metrics
+
+`IocpServer::GetConnectionMetrics()` returns a single consistent snapshot of
+the registry gauges and counters. The existing registry lock covers every
+update and the copy. Formatting and output run after releasing that lock.
+The normal I/O completion path uses its existing lock acquisitions and
+performs no telemetry allocation.
+
+- `connections_accepted_total` increments when an accepted socket is associated with IOCP and inserted in the registry. An immediate failure posting its initial receive still leaves one admission followed by one retirement.
+- `connections_rejected_capacity_total` increments when a socket is declined at the registry cap during normal admission.
+- `connections_closed_total` increments once when a registry entry retires, after its outstanding I/O or handler is accounted for. This includes peer EOF, socket failure, protocol rejection, timeout, and shutdown.
+- `connections_active` is the registry size, including connections with a handler in progress or a closed socket awaiting a completion. `connections_high_watermark` is the maximum size reached on insertion.
+- `pending_io_operations` counts successful overlapped posts whose matching IOCP packets have yet to be accounted for. A matched packet decrements the gauge for success, failure, EOF, and cancellation. An immediate posting failure leaves it unchanged.
+- `idle_timeouts_total`, `incomplete_frame_timeouts_total`, and `send_timeouts_total` count expiration by phase. They increment when a scan closes an open socket, when a successful completion with positive bytes is rejected as expired, or when an expired frame budget prevents another receive from being posted.
+- `io_failures_total` counts runtime listener readiness failures, accept failures other than would-block and pre-admission peer resets, socket association and synchronous post failures, and non-cancellation IOCP errors. An unmatched packet or an unexpected dequeue failure also counts once. Readiness and dequeue timeouts, successful zero-byte completions, protocol rejection, and startup errors leave this counter unchanged.
+- `cancellation_requests_total` increments when timeout or shutdown closes an open socket with a pending operation. `cancellation_completions_total` increments only when a matched IOCP packet reports `ERROR_OPERATION_ABORTED`. The request can also drain as success or another error, and an aborted completion can occur independently of a server close request.
+
+Cumulative counters are unsigned 64-bit values that saturate. They and the
+high-water mark persist across `Start()` and `Stop()` on one server instance.
+A new instance starts at zero. A completed stop leaves both gauges at zero.
+Before counter saturation, accepted minus closed equals active.
+
+The CLI writes a JSON line with event `connection_metrics` to stdout after
+startup, every 30 seconds while running, and after graceful shutdown.
+Each record contains the phase, Unix timestamp in milliseconds, and the
+aggregate snapshot. The payload and model inputs stay out of these records.
+
+### Inference metrics
+
 `Metrics` is a mutex-guarded singleton appending one JSON line per inference to `metrics.jsonl` (opened in append mode in the process working directory):
 
 | Field | Meaning |

@@ -16,11 +16,15 @@ struct IocpServerTestAccess {
     }
 
     static bool DeliverTerminalPacket(IocpServer& server, std::unique_ptr<Connection> owner,
-                                      IOContext& pending, bool stopping, bool succeeded, DWORD bytes) {
+                                      IOContext& pending, bool stopping, DWORD error, DWORD bytes) {
         auto* connection = owner.get();
         server.connections_.emplace(connection, IocpServer::ActiveConnection{std::move(owner), &pending});
+        // Model a registered connection with one posted operation.
+        server.connectionMetrics_.connections_accepted_total = 1;
+        server.connectionMetrics_.connections_high_watermark = 1;
+        server.connectionMetrics_.pending_io_operations = 1;
         server.stopping_.store(stopping);
-        server.ProcessPacket(connection, &pending.overlapped, succeeded, bytes);
+        server.ProcessPacket(connection, &pending.overlapped, error, bytes);
         return server.connections_.empty();
     }
 };
@@ -86,13 +90,15 @@ namespace {
 
         bool Retired() const { return next_ == nullptr; }
 
-        void Terminate(bool stopping, bool succeeded, DWORD bytes) {
+        void Terminate(bool stopping, DWORD error, DWORD bytes) {
             Check(next_ && next_->operation == IOOperation::Write, "expected a pending write during retirement");
             auto* pending = std::exchange(next_, nullptr);
             Check(IocpServerTestAccess::DeliverTerminalPacket(server_, std::move(connection_),
-                                                               *pending, stopping, succeeded, bytes),
+                                                               *pending, stopping, error, bytes),
                   "terminal packet left a registered connection");
         }
+
+        ConnectionMetricsSnapshot Metrics() const { return server_.GetConnectionMetrics(); }
 
         std::size_t readCompletions = 0;
         std::size_t inferences = 0;
@@ -170,13 +176,20 @@ namespace {
               "malformed second frame must retire the connection before inference or receive");
     }
 
-    void TestTerminalPacket(bool stopping, bool succeeded, DWORD bytes) {
+    void TestTerminalPacket(bool stopping, DWORD error, DWORD bytes,
+                            std::uint64_t expectedFailures, std::uint64_t expectedCancellations) {
         CompletionDriver driver;
         auto batch = MakeFrame(7.0f);
         Append(batch, MakeFrame(8.0f));
         driver.Receive(batch);
-        driver.Terminate(stopping, succeeded, bytes);
+        driver.Terminate(stopping, error, bytes);
         Check(driver.inferences == 1, "buffered request ran after disconnect or shutdown");
+        const auto metrics = driver.Metrics();
+        Check(metrics.connections_closed_total == 1 && metrics.connections_active == 0 &&
+                  metrics.pending_io_operations == 0, "terminal packet did not retire exactly one pending connection");
+        Check(metrics.io_failures_total == expectedFailures &&
+                  metrics.cancellation_completions_total == expectedCancellations &&
+                  metrics.cancellation_requests_total == 0, "IOCP terminal status was misclassified");
     }
 
     void TestDefaultPayloadLimit() {
@@ -218,9 +231,10 @@ int main() {
         TestPartialNextFrame(Protocol::HeaderBytes + 2);
         TestBufferedAfterShortWrites();
         TestMalformedSecondFrame();
-        TestTerminalPacket(false, false, 0);
-        TestTerminalPacket(false, true, 0);
-        TestTerminalPacket(true, true, Protocol::HeaderBytes + Protocol::FloatBytes);
+        TestTerminalPacket(false, ERROR_NETNAME_DELETED, 0, 1, 0);
+        TestTerminalPacket(false, ERROR_SUCCESS, 0, 0, 0);
+        TestTerminalPacket(true, ERROR_SUCCESS, Protocol::HeaderBytes + Protocol::FloatBytes, 0, 0);
+        TestTerminalPacket(true, ERROR_OPERATION_ABORTED, 0, 0, 1);
         TestDefaultPayloadLimit();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

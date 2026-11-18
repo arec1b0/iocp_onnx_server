@@ -12,6 +12,7 @@ function Start-TestServer([string] $Limit, [hashtable] $Overrides = @{}) {
     $start.UseShellExecute = $false
     $start.CreateNoWindow = $true
     $start.RedirectStandardError = $true
+    $start.RedirectStandardOutput = $true
     $start.Environment['IOCP_ONNX_MAX_PAYLOAD_BYTES'] = $Limit
     $start.Environment['IOCP_ONNX_MAX_CONNECTIONS'] = '4'
     $start.Environment['IOCP_ONNX_IDLE_TIMEOUT_MS'] = '5000'
@@ -44,6 +45,34 @@ function Assert-StartupRejected([string] $Limit, [hashtable] $Overrides, [string
     } finally {
         Stop-TestServer $server
     }
+}
+
+function Assert-InitialConnectionMetrics([Diagnostics.Process] $Server) {
+    $budget = [TimeSpan]::FromSeconds(5)
+    $wait = [Diagnostics.Stopwatch]::StartNew()
+    while (($remaining = $budget - $wait.Elapsed) -gt [TimeSpan]::Zero) {
+        $pendingLine = $Server.StandardOutput.ReadLineAsync()
+        if (-not $pendingLine.Wait($remaining)) { break }
+        $line = $pendingLine.GetAwaiter().GetResult()
+        if ($null -eq $line) { break }
+        if (-not $line.StartsWith('{"event":"connection_metrics"')) { continue }
+        $metrics = $line | ConvertFrom-Json
+        if ($metrics.phase -ne 'running' -or $metrics.timestamp_ms -le 0) {
+            throw 'Initial connection metrics had the wrong phase or timestamp.'
+        }
+        foreach ($name in @(
+            'connections_accepted_total', 'connections_rejected_capacity_total',
+            'connections_closed_total', 'connections_active', 'connections_high_watermark',
+            'idle_timeouts_total', 'incomplete_frame_timeouts_total', 'send_timeouts_total',
+            'io_failures_total', 'pending_io_operations', 'cancellation_requests_total',
+            'cancellation_completions_total'
+        )) {
+            if ($metrics.$name -ne 0) { throw "Expected an initial zero value for $name." }
+        }
+        Write-Host 'Structured connection metrics startup record passed.'
+        return
+    }
+    throw 'Server did not emit its initial connection metrics snapshot.'
 }
 
 function Connect-TestClient {
@@ -171,8 +200,51 @@ function Test-TruncatedRequest([int] $Length) {
     }
 }
 
+function Test-UnexpectedClientExit {
+    $start = [Diagnostics.ProcessStartInfo]::new((Join-Path $PSHOME 'pwsh.exe'))
+    $start.UseShellExecute = $false
+    $start.CreateNoWindow = $true
+    $start.RedirectStandardOutput = $true
+    $script = @'
+$ErrorActionPreference = 'Stop'
+$client = [Net.Sockets.TcpClient]::new([Net.Sockets.AddressFamily]::InterNetwork)
+if (-not $client.ConnectAsync([Net.IPAddress]::Loopback, 8080).Wait(2500)) { exit 1 }
+$client.ReceiveTimeout = 2500
+$client.SendTimeout = 2500
+$stream = $client.GetStream()
+$frame = [byte[]]::new(48)
+$frame[0] = 10
+$stream.Write($frame)
+$stream.ReadExactly([byte[]]::new(48))
+$stream.Write($frame, 0, 3)
+[Console]::WriteLine('ready')
+[Console]::Out.Flush()
+$null = [Threading.ManualResetEventSlim]::new().Wait(10000)
+exit 1
+'@
+    foreach ($argument in @('-NoProfile', '-NonInteractive', '-EncodedCommand',
+            [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($script)))) {
+        $start.ArgumentList.Add($argument)
+    }
+    $child = [Diagnostics.Process]::Start($start)
+    try {
+        $ready = $child.StandardOutput.ReadLineAsync()
+        if (-not $ready.Wait(5000) -or $ready.Result -ne 'ready' -or $child.HasExited) {
+            throw 'Client process did not establish a persistent connection before termination.'
+        }
+        $child.Kill()
+        if (-not $child.WaitForExit(5000)) { throw 'Terminated client did not exit.' }
+    } finally {
+        Stop-TestServer $child
+    }
+    Test-ValidRequests
+    Write-Host 'Server continued to serve exact responses after the client process was terminated.'
+}
+
 try {
     $null = New-Item -ItemType Directory -Path $modelDir
+    Assert-StartupRejected '40' @{} 'Failed to load model.'
+    Write-Host 'Missing model caused a clean startup failure.'
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot '../models/model.onnx') -Destination $modelDir
 
     foreach ($limit in @('39', '40x', '4294967288', '4294967296')) {
@@ -198,6 +270,7 @@ try {
     $server = Start-TestServer '40'
     $errors = $server.StandardError.ReadToEndAsync()
     try {
+        Assert-InitialConnectionMetrics $server
         $deadline = [Diagnostics.Stopwatch]::StartNew()
         while ($true) {
             if ($server.HasExited) { throw "Server exited with code $($server.ExitCode). $($errors.GetAwaiter().GetResult())" }
@@ -217,7 +290,7 @@ try {
         }
         Test-TruncatedRequest 7
         Test-TruncatedRequest 11
-        Test-ValidRequests
+        Test-UnexpectedClientExit
         if ($server.HasExited) { throw 'Server exited during the protocol test.' }
     } finally {
         Stop-TestServer $server
