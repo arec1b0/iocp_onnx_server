@@ -1,6 +1,7 @@
 #pragma once
 #include <winsock2.h>
 #include <windows.h>
+#include <condition_variable>
 #include <vector>
 #include "Protocol.h"
 #include "SocketHandle.h"
@@ -57,9 +58,13 @@ public:
     void Close();
 
 private:
+    friend class IocpServer;
+
     IOContext* PrepareSendSuffix();
 
     SocketHandle socket_;
+    // An early IOCP packet may wait here until its initial WSASend returns.
+    std::condition_variable sendSubmitted_;
     IOContext readContext_;
     IOContext writeContext_;
     Protocol::RequestFramer requestFramer_;

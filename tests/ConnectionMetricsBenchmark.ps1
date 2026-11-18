@@ -15,117 +15,7 @@ $paths = @{
 }
 
 if (-not ('ConnectionBenchmarkClient' -as [type])) {
-    Add-Type -TypeDefinition @'
-using System;
-using System.Diagnostics;
-using System.IO;
-using System.Net;
-using System.Net.Sockets;
-using System.Threading.Tasks;
-
-public static class ConnectionBenchmarkClient
-{
-    public const int FramesPerBurst = 8;
-    private const int FrameBytes = 48;
-    private const int TimeoutMs = 5000;
-
-    private static byte[] BuildBurst(int multiplier)
-    {
-        var bytes = new byte[FramesPerBurst * FrameBytes];
-        for (var frame = 0; frame < FramesPerBurst; ++frame)
-        {
-            var offset = frame * FrameBytes;
-            BitConverter.GetBytes(10UL).CopyTo(bytes, offset);
-            for (var element = 0; element < 10; ++element)
-            {
-                float value = multiplier * (frame * 10 + element - 5);
-                BitConverter.GetBytes(value).CopyTo(bytes, offset + 8 + 4 * element);
-            }
-        }
-        return bytes;
-    }
-
-    public sealed class Trial
-    {
-        public double ElapsedMs;
-        public double P50Ms;
-        public double P95Ms;
-        public double P99Ms;
-    }
-
-    public static Trial Run(int clients, int connectionsPerClient, int burstsPerConnection)
-    {
-        var request = BuildBurst(1);
-        var expected = BuildBurst(2);
-        var requestsPerClient = connectionsPerClient * burstsPerConnection * FramesPerBurst;
-        var latencies = new long[clients * requestsPerClient];
-        var stopwatch = Stopwatch.StartNew();
-        var options = new ParallelOptions { MaxDegreeOfParallelism = clients };
-        Parallel.For(0, clients, options, worker =>
-        {
-            var response = new byte[expected.Length];
-            var nextLatency = worker * requestsPerClient;
-            for (var connection = 0; connection < connectionsPerClient; ++connection)
-            {
-                using (var client = new TcpClient(AddressFamily.InterNetwork))
-                {
-                    client.NoDelay = true;
-                    client.SendTimeout = TimeoutMs;
-                    client.ReceiveTimeout = TimeoutMs;
-                    if (!client.ConnectAsync(IPAddress.Loopback, 8080).Wait(TimeoutMs))
-                    {
-                        throw new IOException("Benchmark connect timed out.");
-                    }
-                    var stream = client.GetStream();
-                    for (var burst = 0; burst < burstsPerConnection; ++burst)
-                    {
-                        var issued = Stopwatch.GetTimestamp();
-                        stream.Write(request, 0, request.Length);
-                        var offset = 0;
-                        while (offset < response.Length)
-                        {
-                            var read = stream.Read(response, offset, response.Length - offset);
-                            if (read == 0)
-                            {
-                                throw new IOException("Benchmark response was truncated.");
-                            }
-                            var end = offset + read;
-                            if (end / FrameBytes > offset / FrameBytes)
-                            {
-                                var latency = Stopwatch.GetTimestamp() - issued;
-                                for (var frame = offset / FrameBytes; frame < end / FrameBytes; ++frame)
-                                {
-                                    latencies[nextLatency++] = latency;
-                                }
-                            }
-                            offset = end;
-                        }
-                        if (!response.AsSpan().SequenceEqual(expected))
-                        {
-                            throw new IOException("Benchmark response was incorrect.");
-                        }
-                    }
-                    client.Client.Shutdown(SocketShutdown.Send);
-                    if (stream.ReadByte() != -1)
-                    {
-                        throw new IOException("Benchmark connection produced an extra response.");
-                    }
-                }
-            }
-        });
-        stopwatch.Stop();
-        Array.Sort(latencies);
-        double Percentile(double rank) => latencies[(int)Math.Ceiling(rank * latencies.Length) - 1] * 1000.0 / Stopwatch.Frequency;
-        return new Trial
-        {
-            ElapsedMs = stopwatch.Elapsed.TotalMilliseconds,
-            P50Ms = Percentile(0.50),
-            P95Ms = Percentile(0.95),
-            P99Ms = Percentile(0.99)
-        };
-    }
-}
-'@
+    Add-Type -Path (Join-Path $PSScriptRoot 'ConnectionBenchmarkClient.cs')
 }
 
 function Measure-Server([string] $ServerPath, [string] $Directory) {
@@ -172,29 +62,7 @@ function Measure-Server([string] $ServerPath, [string] $Directory) {
     }
 }
 
-function Get-Median([double[]] $Values) {
-    $sorted = [double[]]$Values.Clone()
-    [Array]::Sort($sorted)
-    $middle = [int][Math]::Floor($sorted.Length / 2)
-    if ($sorted.Length % 2) { return $sorted[$middle] }
-    return ($sorted[$middle - 1] + $sorted[$middle]) / 2
-}
-
-function Get-PairedEstimate([double[]] $Changes) {
-    $median = Get-Median $Changes
-    $random = [Random]::new(1701)
-    $medians = [double[]]::new(10000)
-    $resample = [double[]]::new($Changes.Length)
-    for ($i = 0; $i -lt $medians.Length; ++$i) {
-        for ($j = 0; $j -lt $resample.Length; ++$j) { $resample[$j] = $Changes[$random.Next($Changes.Length)] }
-        $medians[$i] = Get-Median $resample
-    }
-    [Array]::Sort($medians)
-    [ordered]@{
-        median_pct = [Math]::Round($median, 3)
-        bootstrap_95_pct = @([Math]::Round($medians[249], 3), [Math]::Round($medians[9749], 3))
-    }
-}
+. (Join-Path $PSScriptRoot 'BenchmarkStatistics.ps1')
 
 $workingDir = [IO.Directory]::CreateTempSubdirectory('iocp-connection-benchmark-').FullName
 $modelDir = Join-Path $workingDir 'models'

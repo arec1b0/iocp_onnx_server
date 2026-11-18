@@ -30,11 +30,11 @@ namespace {
 
 IocpServer::IocpServer(const std::string& ipAddress, int port, int workerThreads,
                        std::size_t inputElements, Inference inference, ConnectionLimits limits, Now now,
-                       ConnectionTrace* trace, InferenceLimits inferenceLimits)
+                       ConnectionTrace* trace, InferenceLimits inferenceLimits, InferenceProfile* profile)
     : ipAddress_(ipAddress), port_(port), workerThreads_(workerThreads),
       listenSocket_(INVALID_SOCKET), iocpHandle_(nullptr),
       inputElements_(inputElements), inference_(std::move(inference)), limits_(limits), now_(std::move(now)),
-      trace_(trace), inferenceLimits_(inferenceLimits) {}
+      trace_(trace), inferenceLimits_(inferenceLimits), profile_(profile) {}
 
 IocpServer::~IocpServer() {
     Stop();
@@ -161,11 +161,12 @@ void IocpServer::StopLocked() {
         return;
     }
 
+    InferenceProfile::Recorder recorder(profile_);
     {
         std::lock_guard registry(registryMutex_);
         stopping_.store(true);
         while (!inferenceQueue_.empty()) {
-            CancelQueuedLocked(connections_.find(inferenceQueue_.front().connection));
+            CancelQueuedLocked(connections_.find(inferenceQueue_.front().connection), recorder.Get());
         }
     }
     inferenceAvailable_.notify_all();
@@ -180,6 +181,8 @@ void IocpServer::StopLocked() {
     {
         std::unique_lock registry(registryMutex_);
         for (auto& entry : connections_) {
+            // The submitter closes this socket as soon as WSASend returns.
+            if (entry.second.activity == Activity::SubmittingSend) continue;
             if (trace_ && entry.second.owner->GetSocket() != INVALID_SOCKET) {
                 TraceLocked(entry.second.peer, "shutdown_close", "stop", entry.second.pending ?
                             OperationName(entry.second.pending->operation) : "handler");
@@ -215,12 +218,15 @@ void IocpServer::StopLocked() {
 }
 
 void IocpServer::AcceptThread() {
+    InferenceProfile::Recorder recorder(profile_);
+    auto* profile = recorder.Get();
     auto nextTimeoutCheck = now_() + limits_.checkInterval;
     while (!stopping_.load()) {
         const auto now = now_();
         if (now >= nextTimeoutCheck) {
-            std::lock_guard registry(registryMutex_);
-            CloseExpiredLocked(now);
+            InferenceProfile::RegistryLock registry(registryMutex_, profile, InferenceProfile::SweepWait,
+                                                    InferenceProfile::SweepHold);
+            CloseExpiredLocked(now, profile);
             nextTimeoutCheck = now + limits_.checkInterval;
         }
 
@@ -266,15 +272,16 @@ void IocpServer::AcceptThread() {
             continue;
         }
         try {
-            Admit(std::move(accepted), trace_ ? &remote : nullptr);
+            Admit(std::move(accepted), trace_ ? &remote : nullptr, profile);
         } catch (const std::exception& error) {
             LOG_ERR("Could not admit connection: " + std::string(error.what()));
         }
     }
 }
 
-void IocpServer::Admit(SocketHandle socket, const sockaddr_in* remote) {
-    std::lock_guard registry(registryMutex_);
+void IocpServer::Admit(SocketHandle socket, const sockaddr_in* remote, InferenceProfile::Counters* profile) {
+    InferenceProfile::RegistryLock registry(registryMutex_, profile, InferenceProfile::AcceptWait,
+                                            InferenceProfile::AcceptHold);
     const auto peer = trace_ ? trace_->Identify(socket.Get(), remote) : ConnectionTrace::Peer{};
     if (stopping_.load()) {
         if (trace_) TraceLocked(peer, "shutdown_reject", "admission", "accept");
@@ -300,6 +307,7 @@ void IocpServer::Admit(SocketHandle socket, const sockaddr_in* remote) {
         const auto error = GetLastError();
         IncrementTotal(connectionMetrics_.io_failures_total);
         if (trace_) TraceLocked(peer, "socket_error", "associate", "accept", error);
+        registry.Unlock();
         LOG_ERR("Could not associate client socket with IOCP.");
         return;
     }
@@ -309,12 +317,24 @@ void IocpServer::Admit(SocketHandle socket, const sockaddr_in* remote) {
     connectionMetrics_.connections_high_watermark =
         (std::max)(connectionMetrics_.connections_high_watermark, static_cast<std::uint64_t>(connections_.size()));
     if (trace_) TraceLocked(peer, "admitted", "admission", "accept");
-    if (!PostLocked(entry->second, *conn->PrepareRead(), now_())) {
+    if (!PostLocked(entry->second, *conn->PrepareRead(), now_(), profile)) {
         RetireLocked(entry);
     }
 }
 
-bool IocpServer::PostLocked(ActiveConnection& active, IOContext& context, Clock::time_point observedAt) {
+bool IocpServer::PostLocked(ActiveConnection& active, IOContext& context, Clock::time_point observedAt,
+                            InferenceProfile::Counters* profile) {
+    if (!ReserveLocked(active, context, observedAt)) return false;
+    const int error = SubmitSocketOperation(active.owner->GetSocket(), context, profile);
+    if (error == 0 || error == WSA_IO_PENDING) {
+        ++connectionMetrics_.pending_io_operations;
+        return true;
+    }
+    RecordPostFailureLocked(active, context.operation, error);
+    return false;
+}
+
+bool IocpServer::ReserveLocked(ActiveConnection& active, IOContext& context, Clock::time_point observedAt) {
     assert(active.pending == nullptr);
     assert(active.activity == Activity::Network);
     const auto socket = active.owner->GetSocket();
@@ -335,56 +355,74 @@ bool IocpServer::PostLocked(ActiveConnection& active, IOContext& context, Clock:
         return false;
     }
 
-    // Reserve before Winsock can queue a completion. The registry lock keeps
-    // a dequeuing worker from claiming it until the submission returns.
+    // The context and its connection stay pinned through submission and I/O.
     active.pending = &context;
-    DWORD flags = 0;
-    const int result = context.operation == IOOperation::Read
-        ? WSARecv(socket, &context.wsaBuf, 1, nullptr, &flags, &context.overlapped, nullptr)
-        : WSASend(socket, &context.wsaBuf, 1, nullptr, 0, &context.overlapped, nullptr);
-    const auto error = result == SOCKET_ERROR ? WSAGetLastError() : 0;
-    if (result != SOCKET_ERROR || error == WSA_IO_PENDING) {
-        ++connectionMetrics_.pending_io_operations;
-        return true;
-    }
-    active.pending = nullptr;
-    IncrementTotal(connectionMetrics_.io_failures_total);
-    if (trace_) TraceLocked(active.peer, "socket_error", "post", OperationName(context.operation), error);
-    return false;
+    return true;
 }
 
-bool IocpServer::QueueInferenceLocked(ActiveConnection& active, std::vector<float> input) {
+int IocpServer::SubmitSocketOperation(SOCKET socket, IOContext& context, InferenceProfile::Counters* profile) {
+    DWORD flags = 0;
+    const auto postingAt = InferenceProfile::Stamp(profile);
+    const bool reading = context.operation == IOOperation::Read;
+    const int result = reading ? WSARecv(socket, &context.wsaBuf, 1, nullptr, &flags, &context.overlapped, nullptr)
+                               : WSASend(socket, &context.wsaBuf, 1, nullptr, 0, &context.overlapped, nullptr);
+    const auto error = result == SOCKET_ERROR ? WSAGetLastError() : 0;
+    if (profile) profile->Record(reading ? InferenceProfile::ReceivePost : InferenceProfile::SendPost, postingAt);
+    return error;
+}
+
+void IocpServer::RecordPostFailureLocked(ActiveConnection& active, IOOperation operation, int error) {
+    active.pending = nullptr;
+    IncrementTotal(connectionMetrics_.io_failures_total);
+    if (trace_) TraceLocked(active.peer, "socket_error", "post", OperationName(operation), error);
+}
+
+bool IocpServer::QueueInferenceLocked(ActiveConnection& active, std::vector<float> input,
+                                      InferenceProfile::Counters* profile, Clock::time_point started) {
     assert(active.pending == nullptr && active.activity == Activity::Network);
+    InferenceProfile::Timer admission(profile, InferenceProfile::Admission);
     if (stopping_.load()) {
         return false;
     }
     if (inferenceQueue_.size() >= inferenceLimits_.queueCapacity) {
+        if (profile) ++profile->rejected;
         if (trace_) TraceLocked(active.peer, "inference_rejected", "scheduler", "queue_full");
         return false;
     }
     try {
+        InferenceProfile::Timer insertion(profile, InferenceProfile::Insertion);
         inferenceQueue_.push_back({active.owner.get(), std::move(input)});
     } catch (const std::bad_alloc&) {
+        if (profile) ++profile->rejected;
         if (trace_) TraceLocked(active.peer, "inference_rejected", "scheduler", "allocation", ERROR_NOT_ENOUGH_MEMORY);
         return false;
     }
     active.queued = std::prev(inferenceQueue_.end());
     active.activity = Activity::Queued;
+    if (profile) {
+        active.requestStarted = started;
+        active.queued->queuedAt = Clock::now();
+        profile->AdmissionDepth(inferenceQueue_.size());
+    }
     inferenceAvailable_.notify_one();
     return true;
 }
 
-bool IocpServer::PeerAbortedLocked(const ActiveConnection& active) {
+bool IocpServer::PeerAbortedLocked(const ActiveConnection& active, InferenceProfile::Counters* profile,
+                                  InferenceProfile::Phase phase) {
     const auto socket = active.owner->GetSocket();
     if (socket == INVALID_SOCKET) {
         return true;
     }
     WSANETWORKEVENTS events{};
     int error = 0;
-    if (WSAEnumNetworkEvents(socket, nullptr, &events) == SOCKET_ERROR) {
-        error = WSAGetLastError();
-    } else if (events.lNetworkEvents & FD_CLOSE) {
-        error = events.iErrorCode[FD_CLOSE_BIT];
+    {
+        InferenceProfile::Timer query(profile, phase);
+        if (WSAEnumNetworkEvents(socket, nullptr, &events) == SOCKET_ERROR) {
+            error = WSAGetLastError();
+        } else if (events.lNetworkEvents & FD_CLOSE) {
+            error = events.iErrorCode[FD_CLOSE_BIT];
+        }
     }
     if (!error) {
         // A graceful FIN may be a client half-close with a response still due.
@@ -395,16 +433,18 @@ bool IocpServer::PeerAbortedLocked(const ActiveConnection& active) {
     return true;
 }
 
-void IocpServer::CancelQueuedLocked(ConnectionRegistry::iterator entry) {
+void IocpServer::CancelQueuedLocked(ConnectionRegistry::iterator entry, InferenceProfile::Counters* profile) {
     auto& active = entry->second;
     assert(active.pending == nullptr && active.activity == Activity::Queued);
     inferenceQueue_.erase(active.queued);
+    if (profile) ++profile->cancelled;
     active.activity = Activity::Network;
     if (trace_) TraceLocked(active.peer, "inference_cancelled", "scheduler", "queued");
     RetireLocked(entry);
 }
 
 bool IocpServer::CloseActiveSocketLocked(ActiveConnection& active) {
+    assert(active.activity != Activity::SubmittingSend);
     if (active.owner->GetSocket() == INVALID_SOCKET) {
         return false;
     }
@@ -436,17 +476,18 @@ void IocpServer::TraceLocked(ConnectionTrace::Peer peer, const char* event, cons
                    connectionMetrics_.pending_io_operations, limits_.maxConnections);
 }
 
-void IocpServer::CloseExpiredLocked(Clock::time_point now) {
+void IocpServer::CloseExpiredLocked(Clock::time_point now, InferenceProfile::Counters* profile) {
     if (stopping_.load()) {
         return;
     }
     for (auto next = connections_.begin(); next != connections_.end();) {
         const auto entry = next++;
         auto& active = entry->second;
+        if (active.activity == Activity::SubmittingSend) continue;
         if (active.activity != Activity::Network && active.owner->GetSocket() != INVALID_SOCKET &&
-            PeerAbortedLocked(active)) {
+            PeerAbortedLocked(active, profile, InferenceProfile::SweepSocket)) {
             if (active.activity == Activity::Queued) {
-                CancelQueuedLocked(entry);
+                CancelQueuedLocked(entry, profile);
             } else {
                 CloseActiveSocketLocked(active);
             }
@@ -471,6 +512,7 @@ void IocpServer::RetireLocked(ConnectionRegistry::iterator entry) {
 }
 
 void IocpServer::WorkerThread() {
+    InferenceProfile::Recorder recorder(profile_);
     for (;;) {
         DWORD bytesTransferred;
         ULONG_PTR completionKey;
@@ -479,7 +521,8 @@ void IocpServer::WorkerThread() {
             iocpHandle_, &bytesTransferred, &completionKey, &overlapped, ShutdownCheckMs);
         const DWORD error = result ? ERROR_SUCCESS : GetLastError();
         if (overlapped) {
-            ProcessPacket(reinterpret_cast<Connection*>(completionKey), overlapped, error, bytesTransferred);
+            ProcessPacket(reinterpret_cast<Connection*>(completionKey), overlapped, error, bytesTransferred,
+                          recorder.Get());
         } else {
             const bool failed = error != ERROR_SUCCESS && error != WAIT_TIMEOUT;
             if (!failed && !stopping_.load()) {
@@ -497,21 +540,38 @@ void IocpServer::WorkerThread() {
     }
 }
 
-void IocpServer::ProcessPacket(Connection* conn, OVERLAPPED* overlapped, DWORD error, DWORD bytesTransferred) {
+void IocpServer::ProcessPacket(Connection* conn, OVERLAPPED* overlapped, DWORD error, DWORD bytesTransferred,
+                               InferenceProfile::Counters* profile) {
     IOOperation operation;
     Clock::time_point observedAt;
+    Clock::time_point requestStarted;
+    const auto packetStarted = InferenceProfile::Stamp(profile);
     {
-        std::lock_guard registry(registryMutex_);
+        InferenceProfile::RegistryLock registry(registryMutex_, profile, InferenceProfile::CompletionWait,
+                                                InferenceProfile::CompletionHold);
         auto entry = connections_.find(conn);
         if (entry == connections_.end() || !entry->second.pending ||
             &entry->second.pending->overlapped != overlapped) {
             IncrementTotal(connectionMetrics_.io_failures_total);
             if (trace_) TraceLocked(entry == connections_.end() ? ConnectionTrace::Peer{} : entry->second.peer,
                                     "unmatched", "completion", "none", error, bytesTransferred);
+            registry.Unlock();
             LOG_ERR("Received an IOCP packet with no matching pending operation.");
             return;
         }
+        if (entry->second.activity == Activity::SubmittingSend) {
+            // The provider may queue a packet before the submitting call returns.
+            // A matching packet guarantees that the reservation survives the wait.
+            auto* active = &entry->second;
+            active->waitingForSubmission = true;
+            InferenceProfile::Timer wait(profile, InferenceProfile::EarlyCompletionWait);
+            registry.Wait(conn->sendSubmitted_, [&] { return active->activity != Activity::SubmittingSend; }, false);
+            active->waitingForSubmission = false;
+            entry = connections_.find(conn); // The registry can rehash during the wait.
+            assert(entry != connections_.end() && entry->second.pending);
+        }
         operation = entry->second.pending->operation;
+        if (profile) requestStarted = entry->second.requestStarted;
         entry->second.pending = nullptr;
         assert(connectionMetrics_.pending_io_operations > 0);
         --connectionMetrics_.pending_io_operations;
@@ -539,27 +599,30 @@ void IocpServer::ProcessPacket(Connection* conn, OVERLAPPED* overlapped, DWORD e
     // Shutdown may close the socket but retains the entry while it is in use.
     CompletionAction action;
     try {
-        action = HandleCompletion(*conn, operation, bytesTransferred);
+        action = HandleCompletion(*conn, operation, bytesTransferred, profile, requestStarted);
     } catch (...) {
         LOG_ERR("Client handler failed.");
     }
 
-    std::lock_guard registry(registryMutex_);
+    InferenceProfile::RegistryLock registry(registryMutex_, profile, InferenceProfile::HandoffWait,
+                                            InferenceProfile::HandoffHold);
     auto entry = connections_.find(conn);
     assert(entry != connections_.end());
     if (action.input) {
-        if (!QueueInferenceLocked(entry->second, std::move(*action.input))) {
+        if (!QueueInferenceLocked(entry->second, std::move(*action.input), profile, packetStarted)) {
             RetireLocked(entry);
         }
         return;
     }
-    if (!action.next || !PostLocked(entry->second, *action.next, observedAt)) {
+    if (!action.next || !PostLocked(entry->second, *action.next, observedAt, profile)) {
         if (trace_ && !action.next) TraceLocked(entry->second.peer, "handler_closed", "handler", OperationName(operation));
         RetireLocked(entry);
     }
 }
 
-IocpServer::CompletionAction IocpServer::HandleCompletion(Connection& conn, IOOperation operation, DWORD bytesTransferred) {
+IocpServer::CompletionAction IocpServer::HandleCompletion(Connection& conn, IOOperation operation, DWORD bytesTransferred,
+                                                           InferenceProfile::Counters* profile,
+                                                           Clock::time_point requestStarted) {
     if (operation == IOOperation::Write) {
         const auto completion = conn.CompleteSend(true, bytesTransferred);
         if (!completion.succeeded) {
@@ -568,8 +631,10 @@ IocpServer::CompletionAction IocpServer::HandleCompletion(Connection& conn, IOOp
         if (completion.remaining) {
             return {completion.remaining};
         }
+        if (profile) profile->Record(InferenceProfile::Response, requestStarted);
     }
 
+    InferenceProfile::Timer frame(profile, InferenceProfile::Frame);
     std::vector<float> inputTensor;
     const auto request = operation == IOOperation::Read
         ? conn.ReadRequest(bytesTransferred, inputTensor)
@@ -584,20 +649,28 @@ IocpServer::CompletionAction IocpServer::HandleCompletion(Connection& conn, IOOp
 }
 
 void IocpServer::InferenceThread() {
+    InferenceProfile::Recorder recorder(profile_);
+    auto* profile = recorder.Get();
+    InferenceProfile::Timer lifetime(profile, InferenceProfile::WorkerLifetime);
     for (;;) {
         InferenceJob job{};
+        Clock::time_point busyStarted;
         {
-            std::unique_lock registry(registryMutex_);
-            inferenceAvailable_.wait(registry, [this] { return stopping_.load() || !inferenceQueue_.empty(); });
+            InferenceProfile::RegistryLock registry(registryMutex_, profile, InferenceProfile::ClaimWait,
+                                                    InferenceProfile::ClaimHold);
+            registry.Wait(inferenceAvailable_, [this] { return stopping_.load() || !inferenceQueue_.empty(); });
             if (stopping_.load()) {
                 return;
             }
             const auto entry = connections_.find(inferenceQueue_.front().connection);
             assert(entry != connections_.end() && entry->second.activity == Activity::Queued);
-            if (PeerAbortedLocked(entry->second)) {
-                CancelQueuedLocked(entry);
+            busyStarted = InferenceProfile::Stamp(profile);
+            if (PeerAbortedLocked(entry->second, profile, InferenceProfile::ClaimSocket)) {
+                CancelQueuedLocked(entry, profile);
                 continue;
             }
+            if (profile) profile->Record(InferenceProfile::QueueWait, inferenceQueue_.front().queuedAt);
+            InferenceProfile::Timer removal(profile, InferenceProfile::Removal);
             job = std::move(inferenceQueue_.front());
             inferenceQueue_.pop_front();
             entry->second.activity = Activity::Running;
@@ -607,28 +680,76 @@ void IocpServer::InferenceThread() {
         // access until this worker returns it to a posted send or retires it.
         IOContext* response = nullptr;
         try {
-            const auto output = RunInference(job.input);
+            const auto output = RunInference(job.input, profile);
+            InferenceProfile::Timer prepare(profile, InferenceProfile::Prepare);
             if (!stopping_.load()) response = job.connection->PrepareResponse(output);
         } catch (...) {
             LOG_ERR("Inference handler failed.");
         }
 
-        std::lock_guard registry(registryMutex_);
-        const auto entry = connections_.find(job.connection);
-        assert(entry != connections_.end() && entry->second.activity == Activity::Running);
-        auto& active = entry->second;
-        active.activity = Activity::Network;
-        if (!response || stopping_.load() || PeerAbortedLocked(active) || !PostLocked(active, *response, now_())) {
-            RetireLocked(entry);
+        DispatchResponse(job.connection, response, profile);
+        if (profile) {
+            ++profile->finished;
+            profile->Record(InferenceProfile::WorkerBusy, busyStarted);
         }
     }
 }
 
-std::vector<float> IocpServer::RunInference(const std::vector<float>& inputTensor) {
-    auto start_time = std::chrono::high_resolution_clock::now();
-    std::vector<float> outputTensor = inference_(inputTensor);
-    auto end_time = std::chrono::high_resolution_clock::now();
+void IocpServer::DispatchResponse(Connection* conn, IOContext* response, InferenceProfile::Counters* profile) {
+    InferenceProfile::Timer dispatch(profile, InferenceProfile::Dispatch);
+    SOCKET socket;
+    {
+        InferenceProfile::RegistryLock registry(registryMutex_, profile, InferenceProfile::DispatchWait,
+                                                InferenceProfile::DispatchHold);
+        const auto entry = connections_.find(conn);
+        assert(entry != connections_.end() && entry->second.activity == Activity::Running);
+        auto& active = entry->second;
+        active.activity = Activity::Network;
+        if (!response || stopping_.load() || PeerAbortedLocked(active, profile, InferenceProfile::DispatchSocket) ||
+            !ReserveLocked(active, *response, {})) {
+            RetireLocked(entry);
+            return;
+        }
+        // This reservation precedes shutdown and prevents close or reuse while
+        // Winsock may still access the socket and OVERLAPPED in the call itself.
+        active.activity = Activity::SubmittingSend;
+        socket = conn->GetSocket();
+    }
 
+    const int error = SubmitSocketOperation(socket, *response, profile);
+#ifdef IOCP_TEST_SEND_SUBMISSION
+    if (afterSendSubmission_) afterSendSubmission_();
+#endif
+
+    InferenceProfile::RegistryLock registry(registryMutex_, profile, InferenceProfile::SubmitResultWait,
+                                            InferenceProfile::SubmitResultHold);
+    const auto entry = connections_.find(conn);
+    assert(entry != connections_.end() && entry->second.activity == Activity::SubmittingSend);
+    auto& active = entry->second;
+    active.activity = Activity::Network;
+    if (error != 0 && error != WSA_IO_PENDING) {
+        // An immediate failure has no completion packet and no possible waiter.
+        RecordPostFailureLocked(active, response->operation, error);
+        RetireLocked(entry);
+        return;
+    }
+    ++connectionMetrics_.pending_io_operations;
+    if (stopping_.load()) {
+        if (trace_) TraceLocked(active.peer, "shutdown_close", "stop", "write");
+        CloseActiveSocketLocked(active);
+    } else if (now_() >= active.deadline && CloseActiveSocketLocked(active)) {
+        RecordTimeoutLocked(active, IOOperation::Write, "post");
+    }
+    if (active.waitingForSubmission) conn->sendSubmitted_.notify_one();
+}
+
+std::vector<float> IocpServer::RunInference(const std::vector<float>& inputTensor, InferenceProfile::Counters* profile) {
+    const auto start_time = Clock::now();
+    std::vector<float> outputTensor = inference_(inputTensor);
+    const auto end_time = Clock::now();
+    if (profile) profile->Record(InferenceProfile::Execute, start_time);
+
+    InferenceProfile::Timer metrics(profile, InferenceProfile::Metrics);
     double latency = std::chrono::duration<double, std::milli>(end_time - start_time).count();
 
     float mean = 0.0f;

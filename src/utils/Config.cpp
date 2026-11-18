@@ -50,12 +50,13 @@ std::optional<Config> Config::Load() {
                                        static_cast<std::uint32_t>(defaults.checkInterval.count()),
                                        1, ConnectionLimits::MaxCheckIntervalMs);
     const auto trace = ReadOverride("IOCP_ONNX_CONNECTION_TRACE", 0, 0, 1);
+    const auto profile = ReadOverride("IOCP_ONNX_INFERENCE_PROFILE", 0, 0, 1);
     const InferenceLimits inferenceDefaults;
     const auto inferenceWorkers = ReadOverride("IOCP_ONNX_INFERENCE_WORKERS", inferenceDefaults.workers,
                                                 1, InferenceLimits::MaxWorkers);
     const auto queueCapacity = ReadOverride("IOCP_ONNX_INFERENCE_QUEUE_CAPACITY", inferenceDefaults.queueCapacity,
                                             1, InferenceLimits::MaxQueueCapacity);
-    if (!payload || !connections || !idle || !frame || !interval || !trace || !inferenceWorkers || !queueCapacity) {
+    if (!payload || !connections || !idle || !frame || !interval || !trace || !profile || !inferenceWorkers || !queueCapacity) {
         return std::nullopt;
     }
     using std::chrono::milliseconds;
@@ -63,5 +64,6 @@ std::optional<Config> Config::Load() {
     config.connectionLimits = {*connections, milliseconds(*idle), milliseconds(*frame), milliseconds(*interval)};
     config.inferenceLimits = {*inferenceWorkers, *queueCapacity};
     config.connectionTrace = *trace != 0;
+    config.inferenceProfile = *profile != 0;
     return config;
 }

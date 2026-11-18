@@ -12,6 +12,7 @@ set(ONNXRUNTIME_DIR "C:/onnxruntime" CACHE PATH "Extracted ONNX Runtime distribu
 include_directories(src ${ONNXRUNTIME_DIR}/include)
 
 set(IOCP_SOURCES
+    src/inference/InferenceProfile.cpp
     src/server/IocpServer.cpp
     src/server/Connection.cpp
     src/server/Protocol.cpp
@@ -57,7 +58,7 @@ if(BUILD_TESTING)
         tests/IocpLifecycleTests.cpp
         ${IOCP_SOURCES}
     )
-    target_compile_definitions(iocp_lifecycle_tests PRIVATE IOCP_TEST_THREAD_FAILURE)
+    target_compile_definitions(iocp_lifecycle_tests PRIVATE IOCP_TEST_THREAD_FAILURE IOCP_TEST_SEND_SUBMISSION)
     add_executable(buffered_pipelining_tests
         tests/BufferedPipeliningTests.cpp
         ${IOCP_SOURCES}

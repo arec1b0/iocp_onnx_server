@@ -28,12 +28,15 @@ struct IocpServerTestAccess {
         std::size_t handlers = 0;
         std::size_t queued = 0;
         std::size_t running = 0;
+        std::size_t submitting = 0;
         std::size_t closed = 0;
         std::size_t frames = 0;
         std::size_t readCapacity = 0;
         ConnectionMetricsSnapshot metrics;
 
-        bool Empty() const { return reads == 0 && writes == 0 && handlers == 0 && queued == 0 && running == 0; }
+        bool Empty() const {
+            return reads == 0 && writes == 0 && handlers == 0 && queued == 0 && running == 0 && submitting == 0;
+        }
     };
 
     static Snapshot Inspect(IocpServer& server) {
@@ -59,7 +62,9 @@ struct IocpServerTestAccess {
         for (const auto& entry : server.connections_) {
             const auto& active = entry.second;
             snapshot.running += (active.activity == IocpServer::Activity::Running);
-            if (!active.pending) {
+            if (active.activity == IocpServer::Activity::SubmittingSend) {
+                ++snapshot.submitting;
+            } else if (!active.pending) {
                 ++snapshot.handlers;
             } else if (active.pending->operation == IOOperation::Read) {
                 ++snapshot.reads;
@@ -87,6 +92,19 @@ struct IocpServerTestAccess {
     static void FailWorkerLaunchAt(IocpServer& server, int workerIndex) {
         server.failWorkerLaunchAt_ = workerIndex;
     }
+
+    static void AfterSendSubmission(IocpServer& server, std::function<void()> callback) {
+        server.afterSendSubmission_ = std::move(callback);
+    }
+
+    static bool HasEarlyCompletion(IocpServer& server) {
+        std::lock_guard lock(server.registryMutex_);
+        return std::any_of(server.connections_.begin(), server.connections_.end(), [](const auto& entry) {
+            return entry.second.waitingForSubmission;
+        });
+    }
+
+    static bool StopRequested(IocpServer& server) { return server.stopping_.load(); }
 
     static bool DisableSendBuffer(IocpServer& server) {
         std::lock_guard lock(server.registryMutex_);
@@ -834,9 +852,22 @@ namespace {
         SendRequest(rejected.Get(), 4.0f);
         CheckPeerClosed(rejected.Get());
         Check(Inspect::Inspect(server).queued == 2, "queue-full rejection displaced a job");
-        auto malformed = Connect(port);
-        SendBytes(malformed.Get(), std::array<char, Protocol::HeaderBytes>{});
-        CheckPeerClosed(malformed.Get());
+        std::array<double, 16> probeMs{};
+        const auto probesStarted = std::chrono::steady_clock::now();
+        for (auto& ms : probeMs) {
+            const auto startedAt = std::chrono::steady_clock::now();
+            auto malformed = Connect(port);
+            SendBytes(malformed.Get(), std::array<char, Protocol::HeaderBytes>{});
+            CheckPeerClosed(malformed.Get());
+            ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - startedAt).count();
+        }
+        const auto probeSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - probesStarted).count();
+        std::sort(probeMs.begin(), probeMs.end());
+        const auto blocked = Inspect::Inspect(server);
+        Check(blocked.running == 1 && blocked.queued == 2, "probe workload escaped the blocked inference gate");
+        std::cout << "{\"event\":\"blocked_inference_io_probe\",\"count\":" << probeMs.size()
+                  << ",\"probes_per_sec\":" << probeMs.size() / probeSeconds << ",\"p50_ms\":" << probeMs[7]
+                  << ",\"p95_ms\":" << probeMs[15] << ",\"p99_ms\":" << probeMs[15] << "}\n";
 
         SetOption(cancelled.Get(), SO_LINGER, linger{1, 0});
         cancelled.Close();
@@ -928,6 +959,48 @@ namespace {
         CheckDrainedMetrics(server, ConnectionLimits{}.maxConnections);
         std::cout << "Shutdown with queued and running inference, restart and cleanup passed.\n";
     }
+
+    void TestEarlyCompletionDuringSendSubmission(bool stopDuringSubmission) {
+        InferenceGate gate;
+        ManualClock clock;
+        IocpServer server("127.0.0.1", 0, 2, 1, Echo, TestLimits, [&] { return clock.Now(); });
+        Inspect::AfterSendSubmission(server, [&] {
+            gate.entered.release();
+            (void)gate.ready.wait_for(15s);
+        });
+        Check(server.Start(), "early-completion server could not start");
+        auto client = Connect(server.BoundPort());
+        CheckResponse(client.Get(), SendRequest(client.Get(), 1.0f));
+        Check(gate.entered.try_acquire_for(4s), "successful send did not reach the submission gate");
+        WaitFor([&] { return Inspect::HasEarlyCompletion(server); }, "early send completion did not reach the gate");
+
+        // The early packet must leave unrelated IOCP completions and the registry available.
+        auto malformed = Connect(server.BoundPort());
+        SendBytes(malformed.Get(), std::array<char, Protocol::HeaderBytes>{});
+        CheckPeerClosed(malformed.Get());
+        std::jthread stop;
+        if (stopDuringSubmission) {
+            stop = std::jthread([&] { server.Stop(); });
+            WaitFor([&] { return Inspect::StopRequested(server); }, "Stop could not reach the registry during submission");
+        } else {
+            Inspect::SweepAt(server, clock, 100);
+        }
+        const auto reserved = Inspect::Inspect(server);
+        Check(reserved.submitting == 1 && reserved.closed == 0 && reserved.metrics.pending_io_operations == 0,
+              "a shutdown or timeout closed or accounted for a send before submission was published");
+        gate.release.set_value();
+        if (stop.joinable()) stop.join();
+        CheckPeerClosed(client.Get());
+        WaitFor([&] { return Inspect::Inspect(server).Empty(); }, "early send completion did not drain");
+        const auto metrics = server.GetConnectionMetrics();
+        Check(metrics.cancellation_requests_total == 1 && metrics.send_timeouts_total == !stopDuringSubmission,
+              "deferred socket closure did not account for shutdown or timeout exactly once");
+        server.Stop();
+        Check(Inspect::Stopped(server), "early completion retained resources");
+        CheckDrainedMetrics(server, TestLimits.maxConnections);
+        std::cout << (stopDuringSubmission ? "Shutdown" : "Timeout")
+                  << " raced safely with a send submission and early completion.\n";
+    }
 }
 
 int main(int argc, char** argv) {
@@ -954,6 +1027,8 @@ int main(int argc, char** argv) {
                 TestInferenceQueue();
                 TestConcurrentInferenceAndReset();
                 TestInferenceQueueShutdownAndRestart();
+                TestEarlyCompletionDuringSendSubmission(true);
+                TestEarlyCompletionDuringSendSubmission(false);
             } else {
                 TestReceiveDisconnect();
                 TestSendDisconnect();

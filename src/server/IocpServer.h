@@ -17,6 +17,7 @@
 #include "ConnectionMetrics.h"
 #include "ConnectionTrace.h"
 #include "inference/InferenceLimits.h"
+#include "inference/InferenceProfile.h"
 
 /// Asynchronous TCP inference server built on Windows I/O Completion Ports.
 ///
@@ -32,7 +33,7 @@ public:
     /// The clock must be monotonic and safe to call from multiple threads.
     IocpServer(const std::string& ipAddress, int port, int workerThreads,
                std::size_t inputElements, Inference inference, ConnectionLimits limits = {}, Now now = Clock::now,
-               ConnectionTrace* trace = nullptr, InferenceLimits inferenceLimits = {});
+               ConnectionTrace* trace = nullptr, InferenceLimits inferenceLimits = {}, InferenceProfile* profile = nullptr);
 
     /// Stops the server if still running.
     ~IocpServer();
@@ -56,9 +57,10 @@ private:
     struct InferenceJob {
         Connection* connection;
         std::vector<float> input;
+        Clock::time_point queuedAt{};
     };
     using InferenceQueue = std::list<InferenceJob>;
-    enum class Activity { Network, Queued, Running };
+    enum class Activity { Network, Queued, Running, SubmittingSend };
 
     struct ActiveConnection {
         std::unique_ptr<Connection> owner;
@@ -68,6 +70,8 @@ private:
         ConnectionTrace::Peer peer;
         Activity activity = Activity::Network;
         InferenceQueue::iterator queued{};
+        Clock::time_point requestStarted{};
+        bool waitingForSubmission = false;
     };
     using ConnectionRegistry = std::unordered_map<Connection*, ActiveConnection>;
 
@@ -81,22 +85,32 @@ private:
     void WorkerThread();
     void InferenceThread();
     void AcceptThread();
-    void Admit(SocketHandle socket, const sockaddr_in* remote = nullptr);
-    void ProcessPacket(Connection* conn, OVERLAPPED* overlapped, DWORD error, DWORD bytesTransferred);
-    static CompletionAction HandleCompletion(Connection& conn, IOOperation operation, DWORD bytesTransferred);
-    std::vector<float> RunInference(const std::vector<float>& input);
+    void Admit(SocketHandle socket, const sockaddr_in* remote = nullptr, InferenceProfile::Counters* profile = nullptr);
+    void ProcessPacket(Connection* conn, OVERLAPPED* overlapped, DWORD error, DWORD bytesTransferred,
+                       InferenceProfile::Counters* profile = nullptr);
+    static CompletionAction HandleCompletion(Connection& conn, IOOperation operation, DWORD bytesTransferred,
+                                             InferenceProfile::Counters* profile = nullptr,
+                                             Clock::time_point requestStarted = {});
+    std::vector<float> RunInference(const std::vector<float>& input, InferenceProfile::Counters* profile = nullptr);
+    void DispatchResponse(Connection* conn, IOContext* response, InferenceProfile::Counters* profile);
+    static int SubmitSocketOperation(SOCKET socket, IOContext& context, InferenceProfile::Counters* profile);
 
     // These require the registry lock. A reserved operation pins its entry
     // until the worker dequeues the completion or posting fails immediately.
-    bool PostLocked(ActiveConnection& active, IOContext& context, Clock::time_point observedAt);
-    bool QueueInferenceLocked(ActiveConnection& active, std::vector<float> input);
-    bool PeerAbortedLocked(const ActiveConnection& active);
-    void CancelQueuedLocked(ConnectionRegistry::iterator entry);
+    bool PostLocked(ActiveConnection& active, IOContext& context, Clock::time_point observedAt,
+                    InferenceProfile::Counters* profile = nullptr);
+    bool ReserveLocked(ActiveConnection& active, IOContext& context, Clock::time_point observedAt);
+    void RecordPostFailureLocked(ActiveConnection& active, IOOperation operation, int error);
+    bool QueueInferenceLocked(ActiveConnection& active, std::vector<float> input, InferenceProfile::Counters* profile,
+                              Clock::time_point started);
+    bool PeerAbortedLocked(const ActiveConnection& active, InferenceProfile::Counters* profile,
+                           InferenceProfile::Phase phase);
+    void CancelQueuedLocked(ConnectionRegistry::iterator entry, InferenceProfile::Counters* profile);
     bool CloseActiveSocketLocked(ActiveConnection& active);
     void RecordTimeoutLocked(const ActiveConnection& active, IOOperation operation, const char* phase, DWORD bytes = 0);
     void TraceLocked(ConnectionTrace::Peer peer, const char* event, const char* phase, const char* operation,
                      DWORD code = 0, DWORD bytes = 0) const noexcept;
-    void CloseExpiredLocked(Clock::time_point now);
+    void CloseExpiredLocked(Clock::time_point now, InferenceProfile::Counters* profile = nullptr);
     void RetireLocked(ConnectionRegistry::iterator entry);
 
     std::string ipAddress_;
@@ -114,12 +128,16 @@ private:
 #ifdef IOCP_TEST_THREAD_FAILURE
     int failWorkerLaunchAt_ = -1;
 #endif
+#ifdef IOCP_TEST_SEND_SUBMISSION
+    std::function<void()> afterSendSubmission_;
+#endif
     const std::size_t inputElements_;
     const Inference inference_;
     const ConnectionLimits limits_;
     const Now now_;
     ConnectionTrace* const trace_;
     const InferenceLimits inferenceLimits_;
+    InferenceProfile* const profile_;
 
     mutable std::mutex lifecycleMutex_;
     std::atomic<bool> stopping_{true};

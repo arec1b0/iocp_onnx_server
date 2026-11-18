@@ -129,6 +129,36 @@ cmake --build build/stage17-baseline --config Release --target iocp_onnx_server 
 
 The benchmark uses the shipped model. Every trial starts a fresh server, warms up the same workload, and validates the ordered response bytes. Each pair runs both variants, with order alternating between pairs. The JSONL has raw trial throughput and request latency percentiles, variant medians, and paired median changes with 95% percentile bootstrap intervals from 10,000 resamples of the pairs. Request latency is measured from the start of the burst write through receipt of the complete response frame. Read coalescing can give multiple frames the same observed completion timestamp. The CTest lifecycle log also reports latency of `GetConnectionMetrics()` with and without active connections. These timings include the snapshot copy and mutex wait, plus scheduling and timer effects. They do not apportion handler-side contention or include formatting and writing the JSON line.
 
+## Scheduler profiling
+
+Set `IOCP_ONNX_INFERENCE_PROFILE=1` before starting the server. After graceful shutdown the server writes `inference-profile.json` in its working directory. Each producer records fixed-size, thread-local aggregates and merges them on exit. Serialization and file output run after the workers join. The profile contains counts and durations only. Keep profiling disabled for throughput comparisons, and use an on/off pair to measure its overhead.
+
+- Timed phases contain sample counts, total nanoseconds, and maximum nanoseconds. Queue admission includes insertion and notification. Queue wait runs from publication to a successful claim, including the claim's close-state check. Queue depth is sampled at successful insertion. Divide `queue_depth_sum_at_admission` by `admitted` for its mean and use `queue_high_watermark` for its maximum.
+- `execute` measures the inference callback, including ONNX tensor setup. `metrics` measures the separate statistics and metrics write. `prepare` measures response serialization. `dispatch` includes reservation, the Winsock send call, and publication of its result.
+- `*_wait` and `*_hold` for registry operations measure ordinary mutex acquisition wait and time holding the mutex. The condition variable's internal reacquisition time is included in queue wait or early-completion wait. `send_post` and `receive_post` time the overlapped provider calls. `response` starts when the IOCP handler receives the completion that exposes the request and ends when it accounts for the final send completion. The client measures the full latency from the burst write to receipt.
+- `finished` counts claimed jobs returned to the registry, including jobs whose response could not be delivered. Successful sends are counted separately by `response.count`. `rejected` counts cap and queue allocation failures. `cancelled` counts removed waiting jobs. Worker utilization is `worker_busy.total_ns / worker_lifetime.total_ns`, including startup and shutdown in the denominator. Empty condition-variable returns include wakeups where another worker already claimed the job.
+
+Use the same Windows host, MSVC configuration, and ONNX Runtime distribution. Run the commands in an isolated PowerShell 7 process with port 8080 free. `-ContextSwitches` samples raw Windows per-thread counters on hosts where the performance provider is accessible. CPU time and private bytes describe the server process. Private bytes are sampled at the end of the measured workload. The commands below assume the three Release executables have already been built.
+
+```powershell
+# The repository already pins onnx 1.22.0 for Python tooling.
+uv run --no-project --with 'onnx==1.22.0' python tests/generate_scheduler_model.py build/scheduler-dense.onnx
+$stage1 = 'build/stage21-baseline/Release/iocp_onnx_server.exe'
+$stage21 = 'build/stage21-release/Release/iocp_onnx_server.exe'
+$stage22 = 'build/stage22-release/Release/iocp_onnx_server.exe'
+pwsh -NoProfile -NonInteractive -File tests/InferenceSchedulerBenchmark.ps1 `
+  -Stage1Exe $stage1 -ReferenceExe $stage21 -CandidateExe $stage22 `
+  -OutputDirectory build/scheduler-trivial -Rounds 15 -ConnectionsPerClient 16
+pwsh -NoProfile -NonInteractive -File tests/InferenceSchedulerBenchmark.ps1 `
+  -Stage1Exe $stage1 -ReferenceExe $stage21 -CandidateExe $stage22 `
+  -Model build/scheduler-dense.onnx -OutputDirectory build/scheduler-dense -Rounds 15
+pwsh -NoProfile -NonInteractive -File tests/InferenceSchedulerBenchmark.ps1 `
+  -Mode ProfileOverhead -CandidateExe $stage22 -OutputDirectory build/scheduler-profile-overhead
+pwsh -NoProfile -NonInteractive -Command '& ./tests/InferenceSchedulerBenchmark.ps1 -Mode Sweep -CandidateExe build/stage22-release/Release/iocp_onnx_server.exe -OutputDirectory build/scheduler-sweep -Workers 1,2,4,8,16 -Queues 1,16,64,256 -Rounds 4 -ConnectionsPerClient 2'
+```
+
+Use a fresh output directory for each invocation. The sweep uses a fixed random seed to vary run order. `trials.jsonl` contains the raw samples, and `summary.json` includes medians and paired bootstrap intervals for comparisons. The dense model expands each request into repeated rows and runs six dense matrix multiplications with an exact `y = 2x` output for the benchmark's integer inputs. It is a synthetic CPU workload. Under capacity-one pressure, latency percentiles describe completed replies. The harness validates each returned response and reconciles connection failures against the server's rejection counter before reporting the trial. The gated `inference_scheduler` CTest also measures loopback network probes while a callback is blocked and the queue is full.
+
 ## Host churn investigation
 
 Run one experiment at a time with port 8080 free. Experiment C is the only case that starts a competing workload. It overlaps the original 45-second mixed smoke with three iterations of the existing ephemeral-loopback lifecycle suite. Experiments B, D, and E use the shipped model and 100 verified requests per phase. B increases the paced connection rate from 5 to 20 to 40 per second. D uses 5 per second throughout. E reuses one connection per phase at B's request pacing. F fills eight registered slots, checks one capacity rejection, verifies the holders still get exact replies, and then checks idle and incomplete-frame expiration.

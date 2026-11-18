@@ -60,9 +60,11 @@ static int RunServer(std::string& finalMetrics) {
 
     LOG_INFO("Starting IOCP Server...");
     const auto trace = config->connectionTrace ? std::make_unique<ConnectionTrace>() : nullptr;
+    const auto profile = config->inferenceProfile ? std::make_unique<InferenceProfile>() : nullptr;
     IocpServer server(config->ipAddress, config->port, config->workerThreads, model.InputElementCount(),
                       [&model](const std::vector<float>& input) { return model.RunInference(input); },
-                      config->connectionLimits, IocpServer::Clock::now, trace.get(), config->inferenceLimits);
+                      config->connectionLimits, IocpServer::Clock::now, trace.get(), config->inferenceLimits,
+                      profile.get());
     
     if (!server.Start()) {
         LOG_ERR("Failed to start server.");
@@ -83,6 +85,7 @@ static int RunServer(std::string& finalMetrics) {
     server.Stop();
     finalMetrics = SerializeConnectionMetrics(server, "stopped");
     if (trace && !trace->Save()) LOG_ERR("Could not save connection-trace.jsonl.");
+    if (profile && !profile->Save()) LOG_ERR("Could not save inference-profile.json.");
     LOG_INFO("Application terminated gracefully.");
     return 0;
 }

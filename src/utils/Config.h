@@ -16,6 +16,7 @@ struct Config {
     ConnectionLimits connectionLimits;
     InferenceLimits inferenceLimits;
     bool connectionTrace;
+    bool inferenceProfile;
 
     /// Returns the default configuration: models/model.onnx, 0.0.0.0:8080,
     /// worker count = hardware_concurrency (fallback 2), a 16 MiB

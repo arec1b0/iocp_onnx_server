@@ -144,6 +144,7 @@ Defaults are defined in [Config.cpp](src/utils/Config.cpp).
 | `IOCP_ONNX_TIMEOUT_CHECK_INTERVAL_MS` | `100` | Timeout scan interval in milliseconds. Range 1–1,000 |
 | `IOCP_ONNX_INFERENCE_WORKERS` | `4` | Maximum simultaneous inference calls. Range 1–64 |
 | `IOCP_ONNX_INFERENCE_QUEUE_CAPACITY` | `64` | Maximum waiting requests across all connections. Range 1–4,096 |
+| `IOCP_ONNX_INFERENCE_PROFILE` | `0` | Set to `1` to collect scheduler timings and save `inference-profile.json` after graceful shutdown |
 
 Set overrides before starting the server using up to ten decimal digits.
 Invalid settings fail startup. The server closes excess clients after TCP
@@ -155,6 +156,7 @@ Tune the queue capacity, worker count, connection count, and payload limit
 together. A smaller scan interval closes quiet sockets sooner and increases
 registry scans.
 See [network deadlines](docs/ARCHITECTURE.md#network-deadlines) for timing rules.
+See [scheduler profiling](docs/RELIABILITY.md#scheduler-profiling) for the timing definitions and benchmark commands.
 
 ### Testing
 
