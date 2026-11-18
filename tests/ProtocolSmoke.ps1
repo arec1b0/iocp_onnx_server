@@ -258,6 +258,8 @@ try {
         IOCP_ONNX_IDLE_TIMEOUT_MS = @('-1', '86400001')
         IOCP_ONNX_FRAME_TIMEOUT_MS = @('0', '1.5', '86400001')
         IOCP_ONNX_TIMEOUT_CHECK_INTERVAL_MS = @('0', '1001')
+        IOCP_ONNX_INFERENCE_WORKERS = @('0', '65')
+        IOCP_ONNX_INFERENCE_QUEUE_CAPACITY = @('0', '4097')
     }
     foreach ($setting in $invalidSettings.GetEnumerator()) {
         foreach ($value in $setting.Value) {

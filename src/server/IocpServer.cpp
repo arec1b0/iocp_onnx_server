@@ -6,6 +6,8 @@
 #include <numeric>
 #include <cmath>
 #include <limits>
+#include <iterator>
+#include <new>
 #ifdef IOCP_TEST_THREAD_FAILURE
 #include <system_error>
 #endif
@@ -28,10 +30,11 @@ namespace {
 
 IocpServer::IocpServer(const std::string& ipAddress, int port, int workerThreads,
                        std::size_t inputElements, Inference inference, ConnectionLimits limits, Now now,
-                       ConnectionTrace* trace)
+                       ConnectionTrace* trace, InferenceLimits inferenceLimits)
     : ipAddress_(ipAddress), port_(port), workerThreads_(workerThreads),
       listenSocket_(INVALID_SOCKET), iocpHandle_(nullptr),
-      inputElements_(inputElements), inference_(std::move(inference)), limits_(limits), now_(std::move(now)), trace_(trace) {}
+      inputElements_(inputElements), inference_(std::move(inference)), limits_(limits), now_(std::move(now)),
+      trace_(trace), inferenceLimits_(inferenceLimits) {}
 
 IocpServer::~IocpServer() {
     Stop();
@@ -43,6 +46,7 @@ bool IocpServer::Start() {
         return true;
     }
     if (port_ < 0 || port_ > 65535 || workerThreads_ <= 0 || !inference_ || !now_ || !limits_.IsValid() ||
+        !inferenceLimits_.IsValid() ||
         inputElements_ > Protocol::MaxPayloadBytes / Protocol::FloatBytes) {
         LOG_ERR("Invalid server configuration.");
         return false;
@@ -65,7 +69,18 @@ bool IocpServer::Start() {
             return false;
         }
 
+        peerEvents_ = WSACreateEvent();
+        if (peerEvents_ == WSA_INVALID_EVENT) {
+            LOG_ERR("Could not create the peer close event.");
+            StopLocked();
+            return false;
+        }
+
         stopping_.store(false);
+        inferenceWorkers_.reserve(inferenceLimits_.workers);
+        for (std::uint32_t i = 0; i < inferenceLimits_.workers; ++i) {
+            inferenceWorkers_.emplace_back(&IocpServer::InferenceThread, this);
+        }
         workers_.reserve(workerThreads_);
         for (int i = 0; i < workerThreads_; ++i) {
 #ifdef IOCP_TEST_THREAD_FAILURE
@@ -149,7 +164,11 @@ void IocpServer::StopLocked() {
     {
         std::lock_guard registry(registryMutex_);
         stopping_.store(true);
+        while (!inferenceQueue_.empty()) {
+            CancelQueuedLocked(connections_.find(inferenceQueue_.front().connection));
+        }
     }
+    inferenceAvailable_.notify_all();
     if (acceptThread_.joinable()) {
         acceptThread_.join();
     }
@@ -170,6 +189,10 @@ void IocpServer::StopLocked() {
         registryDrained_.wait(registry, [this] { return connections_.empty(); });
     }
 
+    for (auto& worker : inferenceWorkers_) {
+        worker.join();
+    }
+    inferenceWorkers_.clear();
     for (auto& worker : workers_) {
         if (worker.joinable()) {
             worker.join();
@@ -177,6 +200,10 @@ void IocpServer::StopLocked() {
     }
     workers_.clear();
 
+    if (peerEvents_ != WSA_INVALID_EVENT) {
+        WSACloseEvent(peerEvents_);
+        peerEvents_ = WSA_INVALID_EVENT;
+    }
     if (iocpHandle_) {
         CloseHandle(iocpHandle_);
         iocpHandle_ = nullptr;
@@ -258,6 +285,14 @@ void IocpServer::Admit(SocketHandle socket, const sockaddr_in* remote) {
         if (trace_) TraceLocked(peer, "capacity_reject", "admission", "accept");
         return;
     }
+    // A shared event enables a separate FD_CLOSE record on each socket.
+    // We enumerate the records without waiting on or resetting the event.
+    if (WSAEventSelect(socket.Get(), peerEvents_, FD_CLOSE) == SOCKET_ERROR) {
+        const auto error = WSAGetLastError();
+        IncrementTotal(connectionMetrics_.io_failures_total);
+        if (trace_) TraceLocked(peer, "socket_error", "associate", "close", error);
+        return;
+    }
     auto owner = std::make_unique<Connection>(std::move(socket), inputElements_ * Protocol::FloatBytes);
     auto* conn = owner.get();
     if (!CreateIoCompletionPort(reinterpret_cast<HANDLE>(conn->GetSocket()), iocpHandle_,
@@ -281,6 +316,7 @@ void IocpServer::Admit(SocketHandle socket, const sockaddr_in* remote) {
 
 bool IocpServer::PostLocked(ActiveConnection& active, IOContext& context, Clock::time_point observedAt) {
     assert(active.pending == nullptr);
+    assert(active.activity == Activity::Network);
     const auto socket = active.owner->GetSocket();
     if (stopping_.load() || socket == INVALID_SOCKET) {
         return false;
@@ -315,6 +351,57 @@ bool IocpServer::PostLocked(ActiveConnection& active, IOContext& context, Clock:
     IncrementTotal(connectionMetrics_.io_failures_total);
     if (trace_) TraceLocked(active.peer, "socket_error", "post", OperationName(context.operation), error);
     return false;
+}
+
+bool IocpServer::QueueInferenceLocked(ActiveConnection& active, std::vector<float> input) {
+    assert(active.pending == nullptr && active.activity == Activity::Network);
+    if (stopping_.load()) {
+        return false;
+    }
+    if (inferenceQueue_.size() >= inferenceLimits_.queueCapacity) {
+        if (trace_) TraceLocked(active.peer, "inference_rejected", "scheduler", "queue_full");
+        return false;
+    }
+    try {
+        inferenceQueue_.push_back({active.owner.get(), std::move(input)});
+    } catch (const std::bad_alloc&) {
+        if (trace_) TraceLocked(active.peer, "inference_rejected", "scheduler", "allocation", ERROR_NOT_ENOUGH_MEMORY);
+        return false;
+    }
+    active.queued = std::prev(inferenceQueue_.end());
+    active.activity = Activity::Queued;
+    inferenceAvailable_.notify_one();
+    return true;
+}
+
+bool IocpServer::PeerAbortedLocked(const ActiveConnection& active) {
+    const auto socket = active.owner->GetSocket();
+    if (socket == INVALID_SOCKET) {
+        return true;
+    }
+    WSANETWORKEVENTS events{};
+    int error = 0;
+    if (WSAEnumNetworkEvents(socket, nullptr, &events) == SOCKET_ERROR) {
+        error = WSAGetLastError();
+    } else if (events.lNetworkEvents & FD_CLOSE) {
+        error = events.iErrorCode[FD_CLOSE_BIT];
+    }
+    if (!error) {
+        // A graceful FIN may be a client half-close with a response still due.
+        return false;
+    }
+    IncrementTotal(connectionMetrics_.io_failures_total);
+    if (trace_) TraceLocked(active.peer, "socket_error", "scheduler", "close", error);
+    return true;
+}
+
+void IocpServer::CancelQueuedLocked(ConnectionRegistry::iterator entry) {
+    auto& active = entry->second;
+    assert(active.pending == nullptr && active.activity == Activity::Queued);
+    inferenceQueue_.erase(active.queued);
+    active.activity = Activity::Network;
+    if (trace_) TraceLocked(active.peer, "inference_cancelled", "scheduler", "queued");
+    RetireLocked(entry);
 }
 
 bool IocpServer::CloseActiveSocketLocked(ActiveConnection& active) {
@@ -353,8 +440,18 @@ void IocpServer::CloseExpiredLocked(Clock::time_point now) {
     if (stopping_.load()) {
         return;
     }
-    for (auto& entry : connections_) {
-        auto& active = entry.second;
+    for (auto next = connections_.begin(); next != connections_.end();) {
+        const auto entry = next++;
+        auto& active = entry->second;
+        if (active.activity != Activity::Network && active.owner->GetSocket() != INVALID_SOCKET &&
+            PeerAbortedLocked(active)) {
+            if (active.activity == Activity::Queued) {
+                CancelQueuedLocked(entry);
+            } else {
+                CloseActiveSocketLocked(active);
+            }
+            continue;
+        }
         if (active.pending && now >= active.deadline && CloseActiveSocketLocked(active)) {
             RecordTimeoutLocked(active, active.pending->operation, "scan");
         }
@@ -363,6 +460,7 @@ void IocpServer::CloseExpiredLocked(Clock::time_point now) {
 
 void IocpServer::RetireLocked(ConnectionRegistry::iterator entry) {
     assert(entry->second.pending == nullptr);
+    assert(entry->second.activity == Activity::Network);
     const auto peer = entry->second.peer;
     connections_.erase(entry);
     IncrementTotal(connectionMetrics_.connections_closed_total);
@@ -439,9 +537,9 @@ void IocpServer::ProcessPacket(Connection* conn, OVERLAPPED* overlapped, DWORD e
 
     // This worker alone owns protocol state until it hands the entry back.
     // Shutdown may close the socket but retains the entry while it is in use.
-    IOContext* next = nullptr;
+    CompletionAction action;
     try {
-        next = HandleCompletion(*conn, operation, bytesTransferred);
+        action = HandleCompletion(*conn, operation, bytesTransferred);
     } catch (...) {
         LOG_ERR("Client handler failed.");
     }
@@ -449,20 +547,26 @@ void IocpServer::ProcessPacket(Connection* conn, OVERLAPPED* overlapped, DWORD e
     std::lock_guard registry(registryMutex_);
     auto entry = connections_.find(conn);
     assert(entry != connections_.end());
-    if (!next || !PostLocked(entry->second, *next, observedAt)) {
-        if (trace_ && !next) TraceLocked(entry->second.peer, "handler_closed", "handler", OperationName(operation));
+    if (action.input) {
+        if (!QueueInferenceLocked(entry->second, std::move(*action.input))) {
+            RetireLocked(entry);
+        }
+        return;
+    }
+    if (!action.next || !PostLocked(entry->second, *action.next, observedAt)) {
+        if (trace_ && !action.next) TraceLocked(entry->second.peer, "handler_closed", "handler", OperationName(operation));
         RetireLocked(entry);
     }
 }
 
-IOContext* IocpServer::HandleCompletion(Connection& conn, IOOperation operation, DWORD bytesTransferred) {
+IocpServer::CompletionAction IocpServer::HandleCompletion(Connection& conn, IOOperation operation, DWORD bytesTransferred) {
     if (operation == IOOperation::Write) {
         const auto completion = conn.CompleteSend(true, bytesTransferred);
         if (!completion.succeeded) {
-            return nullptr;
+            return {};
         }
         if (completion.remaining) {
-            return completion.remaining;
+            return {completion.remaining};
         }
     }
 
@@ -471,15 +575,56 @@ IOContext* IocpServer::HandleCompletion(Connection& conn, IOOperation operation,
         ? conn.ReadRequest(bytesTransferred, inputTensor)
         : conn.ReadBufferedRequest(inputTensor);
     if (request == Protocol::ReadResult::Invalid) {
-        return nullptr;
+        return {};
     }
     if (request == Protocol::ReadResult::Incomplete) {
-        return conn.PrepareRead();
+        return {conn.PrepareRead()};
     }
-    if (stopping_.load()) {
-        return nullptr;
-    }
+    return {nullptr, std::move(inputTensor)};
+}
 
+void IocpServer::InferenceThread() {
+    for (;;) {
+        InferenceJob job{};
+        {
+            std::unique_lock registry(registryMutex_);
+            inferenceAvailable_.wait(registry, [this] { return stopping_.load() || !inferenceQueue_.empty(); });
+            if (stopping_.load()) {
+                return;
+            }
+            const auto entry = connections_.find(inferenceQueue_.front().connection);
+            assert(entry != connections_.end() && entry->second.activity == Activity::Queued);
+            if (PeerAbortedLocked(entry->second)) {
+                CancelQueuedLocked(entry);
+                continue;
+            }
+            job = std::move(inferenceQueue_.front());
+            inferenceQueue_.pop_front();
+            entry->second.activity = Activity::Running;
+        }
+
+        // The Running state pins the connection and grants exclusive protocol
+        // access until this worker returns it to a posted send or retires it.
+        IOContext* response = nullptr;
+        try {
+            const auto output = RunInference(job.input);
+            if (!stopping_.load()) response = job.connection->PrepareResponse(output);
+        } catch (...) {
+            LOG_ERR("Inference handler failed.");
+        }
+
+        std::lock_guard registry(registryMutex_);
+        const auto entry = connections_.find(job.connection);
+        assert(entry != connections_.end() && entry->second.activity == Activity::Running);
+        auto& active = entry->second;
+        active.activity = Activity::Network;
+        if (!response || stopping_.load() || PeerAbortedLocked(active) || !PostLocked(active, *response, now_())) {
+            RetireLocked(entry);
+        }
+    }
+}
+
+std::vector<float> IocpServer::RunInference(const std::vector<float>& inputTensor) {
     auto start_time = std::chrono::high_resolution_clock::now();
     std::vector<float> outputTensor = inference_(inputTensor);
     auto end_time = std::chrono::high_resolution_clock::now();
@@ -498,5 +643,5 @@ IOContext* IocpServer::HandleCompletion(Connection& conn, IOOperation operation,
 
     InferenceStats stats{latency, mean, stddev, inputTensor.size()};
     Metrics::GetInstance().RecordInference(stats);
-    return stopping_.load() ? nullptr : conn.PrepareResponse(outputTensor);
+    return outputTensor;
 }

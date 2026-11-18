@@ -12,7 +12,9 @@ struct IocpServerTestAccess {
     }
 
     static IOContext* Complete(IocpServer& server, Connection& connection, IOOperation operation, DWORD bytes) {
-        return server.HandleCompletion(connection, operation, bytes);
+        auto action = server.HandleCompletion(connection, operation, bytes);
+        // Simulate the inference worker handoff without scheduling or sockets.
+        return action.input ? connection.PrepareResponse(server.RunInference(*action.input)) : action.next;
     }
 
     static bool DeliverTerminalPacket(IocpServer& server, std::unique_ptr<Connection> owner,

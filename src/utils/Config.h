@@ -3,6 +3,7 @@
 #include <optional>
 #include <string>
 #include "server/ConnectionLimits.h"
+#include "inference/InferenceLimits.h"
 
 /// Runtime configuration for the server.
 ///
@@ -13,6 +14,7 @@ struct Config {
     int workerThreads;       ///< IOCP worker pool size.
     std::uint32_t maxPayloadBytes;  ///< Limit for each float32 payload.
     ConnectionLimits connectionLimits;
+    InferenceLimits inferenceLimits;
     bool connectionTrace;
 
     /// Returns the default configuration: models/model.onnx, 0.0.0.0:8080,

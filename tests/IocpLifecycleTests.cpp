@@ -26,12 +26,14 @@ struct IocpServerTestAccess {
         std::size_t reads = 0;
         std::size_t writes = 0;
         std::size_t handlers = 0;
+        std::size_t queued = 0;
+        std::size_t running = 0;
         std::size_t closed = 0;
         std::size_t frames = 0;
         std::size_t readCapacity = 0;
         ConnectionMetricsSnapshot metrics;
 
-        bool Empty() const { return reads == 0 && writes == 0 && handlers == 0; }
+        bool Empty() const { return reads == 0 && writes == 0 && handlers == 0 && queued == 0 && running == 0; }
     };
 
     static Snapshot Inspect(IocpServer& server) {
@@ -52,9 +54,11 @@ struct IocpServerTestAccess {
 
     static Snapshot InspectLocked(const IocpServer& server) {
         Snapshot snapshot;
+        snapshot.queued = server.inferenceQueue_.size();
         snapshot.metrics = server.connectionMetrics_;
         for (const auto& entry : server.connections_) {
             const auto& active = entry.second;
+            snapshot.running += (active.activity == IocpServer::Activity::Running);
             if (!active.pending) {
                 ++snapshot.handlers;
             } else if (active.pending->operation == IOOperation::Read) {
@@ -75,7 +79,8 @@ struct IocpServerTestAccess {
         std::lock_guard lifecycle(server.lifecycleMutex_);
         return !server.winsockStarted_ && !server.iocpHandle_ &&
             server.listenSocket_ == INVALID_SOCKET && server.boundPort_ == 0 &&
-            server.workers_.empty() && !server.acceptThread_.joinable() && Inspect(server).Empty();
+            server.workers_.empty() && server.inferenceWorkers_.empty() && !server.acceptThread_.joinable() &&
+            server.peerEvents_ == WSA_INVALID_EVENT && Inspect(server).Empty();
     }
 
     // Called before Start or after the failed Start has fully rolled back.
@@ -787,6 +792,142 @@ namespace {
         CheckResponse(valid.Get(), SendRequest(valid.Get(), 11.0f));
         std::cout << "Automatic loopback sweep closed idle and incomplete clients, then served a valid request.\n";
     }
+
+    struct InferenceGate {
+        std::counting_semaphore<2> entered{0};
+        std::promise<void> release;
+        const std::shared_future<void> ready = release.get_future().share();
+
+        void Block() {
+            entered.release();
+            Check(ready.wait_for(15s) == std::future_status::ready, "inference gate expired");
+        }
+    };
+
+    void TestInferenceQueue() {
+        InferenceGate gate;
+        std::vector<float> started;
+        IocpServer server("127.0.0.1", 0, 1, 1, [&](const std::vector<float>& input) {
+            started.push_back(input.front());
+            if (input.front() == 1.0f) gate.Block();
+            return input;
+        }, {}, IocpServer::Clock::now, nullptr, {1, 2});
+        Check(server.Start(), "inference queue server could not start");
+        const auto port = server.BoundPort();
+        auto first = Connect(port);
+        const auto firstFrame = SendRequest(first.Get(), 1.0f);
+        Check(gate.entered.try_acquire_for(4s), "first job did not start");
+
+        auto cancelled = Connect(port);
+        SendRequest(cancelled.Get(), 2.0f);
+        WaitFor([&] { return Inspect::Inspect(server).queued == 1; }, "cancellation test job was not queued");
+        auto pipeline = Connect(port);
+        const auto second = MakeRequest(3.0f);
+        const auto third = MakeRequest(6.0f);
+        std::array<char, Frame{}.size() * 2> frames{};
+        std::copy(second.begin(), second.end(), frames.begin());
+        std::copy(third.begin(), third.end(), frames.begin() + second.size());
+        SendBytes(pipeline.Get(), frames);
+        WaitFor([&] { return Inspect::Inspect(server).queued == 2; }, "queue did not fill");
+
+        auto rejected = Connect(port);
+        SendRequest(rejected.Get(), 4.0f);
+        CheckPeerClosed(rejected.Get());
+        Check(Inspect::Inspect(server).queued == 2, "queue-full rejection displaced a job");
+        auto malformed = Connect(port);
+        SendBytes(malformed.Get(), std::array<char, Protocol::HeaderBytes>{});
+        CheckPeerClosed(malformed.Get());
+
+        SetOption(cancelled.Get(), SO_LINGER, linger{1, 0});
+        cancelled.Close();
+        WaitFor([&] { return Inspect::Inspect(server).queued == 1; }, "reset did not release a queue slot");
+        auto next = Connect(port);
+        const auto nextFrame = SendRequest(next.Get(), 5.0f);
+        WaitFor([&] { return Inspect::Inspect(server).queued == 2; }, "freed queue slot was not reusable");
+        Check(shutdown(pipeline.Get(), SD_SEND) == 0, "could not half-close pipelined client");
+
+        gate.release.set_value();
+        CheckResponse(first.Get(), firstFrame);
+        CheckResponse(pipeline.Get(), second);
+        CheckResponse(pipeline.Get(), third);
+        CheckPeerClosed(pipeline.Get());
+        CheckResponse(next.Get(), nextFrame);
+        server.Stop();
+        Check(started == std::vector<float>{1.0f, 3.0f, 5.0f, 6.0f}, "scheduler violated FIFO or started a rejected job");
+        Check(Inspect::Stopped(server), "queue test retained resources");
+        CheckDrainedMetrics(server, ConnectionLimits{}.maxConnections);
+        std::cout << "Inference FIFO, overload, queued cancellation, IOCP progress, half-close and response ordering passed.\n";
+    }
+
+    void TestConcurrentInferenceAndReset() {
+        InferenceGate gate;
+        IocpServer server("127.0.0.1", 0, 1, 1, [&](const std::vector<float>& input) {
+            gate.Block();
+            return input;
+        }, {}, IocpServer::Clock::now, nullptr, {2, 1});
+        Check(server.Start(), "concurrent inference server could not start");
+        auto reset = Connect(server.BoundPort());
+        SendRequest(reset.Get(), 1.0f);
+        Check(gate.entered.try_acquire_for(4s), "first inference worker did not start");
+        auto healthy = Connect(server.BoundPort());
+        const auto frame = SendRequest(healthy.Get(), 2.0f);
+        Check(gate.entered.try_acquire_for(4s), "second inference worker did not run concurrently");
+        SetOption(reset.Get(), SO_LINGER, linger{1, 0});
+        reset.Close();
+        WaitFor([&] {
+            const auto state = Inspect::Inspect(server);
+            return state.running == 2 && state.closed == 1 && state.metrics.pending_io_operations == 0;
+        }, "running reset did not close the socket and retain the job");
+        gate.release.set_value();
+        CheckResponse(healthy.Get(), frame);
+        healthy.Close();
+        WaitFor([&] { return Inspect::Inspect(server).Empty(); }, "running reset left an undrained connection");
+        server.Stop();
+        Check(Inspect::Stopped(server), "concurrent inference test retained resources");
+        CheckDrainedMetrics(server, ConnectionLimits{}.maxConnections);
+        std::cout << "Concurrent inference and a reset during inference passed.\n";
+    }
+
+    void TestInferenceQueueShutdownAndRestart() {
+        InferenceGate gate;
+        std::vector<float> started;
+        IocpServer server("127.0.0.1", 0, 1, 1, [&](const std::vector<float>& input) {
+            started.push_back(input.front());
+            if (input.front() == 1.0f) gate.Block();
+            return input;
+        }, {}, IocpServer::Clock::now, nullptr, {1, 2});
+        Check(server.Start(), "queue shutdown server could not start");
+        auto running = Connect(server.BoundPort());
+        SendRequest(running.Get(), 1.0f);
+        Check(gate.entered.try_acquire_for(4s), "shutdown test job did not start");
+        auto queued = Connect(server.BoundPort());
+        SendRequest(queued.Get(), 2.0f);
+        WaitFor([&] { return Inspect::Inspect(server).queued == 1; }, "shutdown test job did not queue");
+        std::atomic<bool> stopped{false};
+        std::jthread stop([&] {
+            server.Stop();
+            stopped.store(true);
+        });
+        CheckPeerClosed(queued.Get());
+        CheckPeerClosed(running.Get());
+        const auto draining = Inspect::Inspect(server);
+        Check(draining.queued == 0 && draining.running == 1 && draining.metrics.pending_io_operations == 0 &&
+              !stopped.load(), "shutdown failed to cancel queued work or wait for running work");
+        gate.release.set_value();
+        stop.join();
+        Check(Inspect::Stopped(server), "scheduler did not drain during shutdown");
+        CheckDrainedMetrics(server, ConnectionLimits{}.maxConnections);
+
+        Check(server.Start(), "scheduler could not restart");
+        auto restarted = Connect(server.BoundPort());
+        CheckResponse(restarted.Get(), SendRequest(restarted.Get(), 3.0f));
+        server.Stop();
+        server.Stop();
+        Check(started == std::vector<float>{1.0f, 3.0f}, "cancelled job ran during shutdown or restart");
+        Check(Inspect::Stopped(server), "scheduler restart retained resources");
+        CheckDrainedMetrics(server, ConnectionLimits{}.maxConnections);
+        std::cout << "Shutdown with queued and running inference, restart and cleanup passed.\n";
+    }
 }
 
 int main(int argc, char** argv) {
@@ -809,6 +950,10 @@ int main(int argc, char** argv) {
                 TestTimeoutRacingWithPeerReset();
                 TestWallClockSweep();
                 std::cout << "Connection metrics accounting passed.\n";
+            } else if (argc == 2 && std::string_view(argv[1]) == "--inference-scheduler") {
+                TestInferenceQueue();
+                TestConcurrentInferenceAndReset();
+                TestInferenceQueueShutdownAndRestart();
             } else {
                 TestReceiveDisconnect();
                 TestSendDisconnect();

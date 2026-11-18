@@ -50,12 +50,18 @@ std::optional<Config> Config::Load() {
                                        static_cast<std::uint32_t>(defaults.checkInterval.count()),
                                        1, ConnectionLimits::MaxCheckIntervalMs);
     const auto trace = ReadOverride("IOCP_ONNX_CONNECTION_TRACE", 0, 0, 1);
-    if (!payload || !connections || !idle || !frame || !interval || !trace) {
+    const InferenceLimits inferenceDefaults;
+    const auto inferenceWorkers = ReadOverride("IOCP_ONNX_INFERENCE_WORKERS", inferenceDefaults.workers,
+                                                1, InferenceLimits::MaxWorkers);
+    const auto queueCapacity = ReadOverride("IOCP_ONNX_INFERENCE_QUEUE_CAPACITY", inferenceDefaults.queueCapacity,
+                                            1, InferenceLimits::MaxQueueCapacity);
+    if (!payload || !connections || !idle || !frame || !interval || !trace || !inferenceWorkers || !queueCapacity) {
         return std::nullopt;
     }
     using std::chrono::milliseconds;
     config.maxPayloadBytes = *payload;
     config.connectionLimits = {*connections, milliseconds(*idle), milliseconds(*frame), milliseconds(*interval)};
+    config.inferenceLimits = {*inferenceWorkers, *queueCapacity};
     config.connectionTrace = *trace != 0;
     return config;
 }

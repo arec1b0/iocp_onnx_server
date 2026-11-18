@@ -62,7 +62,7 @@ static int RunServer(std::string& finalMetrics) {
     const auto trace = config->connectionTrace ? std::make_unique<ConnectionTrace>() : nullptr;
     IocpServer server(config->ipAddress, config->port, config->workerThreads, model.InputElementCount(),
                       [&model](const std::vector<float>& input) { return model.RunInference(input); },
-                      config->connectionLimits, IocpServer::Clock::now, trace.get());
+                      config->connectionLimits, IocpServer::Clock::now, trace.get(), config->inferenceLimits);
     
     if (!server.Start()) {
         LOG_ERR("Failed to start server.");

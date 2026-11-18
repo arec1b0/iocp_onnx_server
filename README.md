@@ -64,14 +64,15 @@ iocp_onnx_server/
                     │        │                                    │
                     │        │ reassemble request (state machine) │
                     │        ▼                                    │
-                    │  OnnxModel::RunInference (zero-copy)        │
+                    │  Bounded FIFO → inference worker pool       │
+                    │        │ OnnxModel::RunInference (zero-copy)│
                     │        │                                    │
                     │        ├──► Metrics (metrics.jsonl)         │
                     │        └──► WSASend response                │
                     └─────────────────────────────────────────────┘
 ```
 
-Each accepted connection is associated with the completion port. Worker threads block on `GetQueuedCompletionStatus`; when a read completes, they append the bytes to the connection's accumulation buffer, run a header/payload state machine, and — once a full request is buffered — execute inference and post an asynchronous send. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design, including the connection lifecycle and known limitations.
+IOCP workers reassemble requests and enqueue complete frames. Dedicated inference workers run the model and post asynchronous response sends. Each connection has one request in flight, so pipelined responses stay in order. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for ownership, overload, and shutdown behavior.
 
 ## Binary Protocol
 
@@ -141,13 +142,18 @@ Defaults are defined in [Config.cpp](src/utils/Config.cpp).
 | `IOCP_ONNX_IDLE_TIMEOUT_MS` | `60000` | Idle receive or stalled send budget in milliseconds. Range 1–86,400,000 |
 | `IOCP_ONNX_FRAME_TIMEOUT_MS` | `15000` | Absolute incomplete-frame budget in milliseconds. Range 1–86,400,000 |
 | `IOCP_ONNX_TIMEOUT_CHECK_INTERVAL_MS` | `100` | Timeout scan interval in milliseconds. Range 1–1,000 |
+| `IOCP_ONNX_INFERENCE_WORKERS` | `4` | Maximum simultaneous inference calls. Range 1–64 |
+| `IOCP_ONNX_INFERENCE_QUEUE_CAPACITY` | `64` | Maximum waiting requests across all connections. Range 1–4,096 |
 
 Set overrides before starting the server using up to ten decimal digits.
 Invalid settings fail startup. The server closes excess clients after TCP
-accept. Closing connections still occupy a slot until pending I/O drains.
-Tune the connection count and payload limit together because each admitted
-connection owns receive, payload, and response storage. A smaller scan
-interval closes quiet sockets sooner and increases registry scans.
+accept. Closing connections still occupy a slot while pending I/O or a
+running inference job holds them.
+The server closes the connection submitting a complete request when the
+inference queue is full. Each waiting request holds one model-sized input.
+Tune the queue capacity, worker count, connection count, and payload limit
+together. A smaller scan interval closes quiet sockets sooner and increases
+registry scans.
 See [network deadlines](docs/ARCHITECTURE.md#network-deadlines) for timing rules.
 
 ### Testing
@@ -211,7 +217,7 @@ Release binary. See the [local CI parity commands](docs/RELIABILITY.md#windows-c
 
 This is a compact educational/prototyping server, not a hardened production gateway. The most important caveats (detailed in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)):
 
-- One inference per completion: requests execute directly on IOCP worker threads (intra-op parallelism is set to 1), so throughput scales with worker count, and a slow model blocks its worker.
+- Shutdown waits for running inference calls to return. A hard execution deadline requires isolating inference in a process that can be terminated independently.
 - Only the model's first input/output node is served; all tensors are `float32`.
 
 ## License

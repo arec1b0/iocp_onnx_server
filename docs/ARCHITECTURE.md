@@ -17,22 +17,31 @@ This document describes the internal design of the IOCP ONNX Inference Server: i
 
 ## Threading Model
 
-The server runs **1 + N + 1** threads:
+The server owns a main thread, an accept thread, and two worker pools.
 
 - **Main thread** — after startup, sleeps in a 100 ms polling loop until a termination signal flips the global `g_Running` flag, then calls `IocpServer::Stop()`.
 - **Accept thread** (1) — waits for readiness on the nonblocking listener with a finite `select` timeout. It associates accepted sockets with the completion port before admitting them and posting the first read.
-- **Worker threads** (N = `Config::workerThreads`, default `std::thread::hardware_concurrency()`) — service I/O completions with `GetQueuedCompletionStatus`. A finite wait lets idle workers observe shutdown after the registry drains. Inference runs directly on these threads outside the connection registry lock.
+- **IOCP workers** (`Config::workerThreads`, default `std::thread::hardware_concurrency()`) service I/O completions, advance the framer, and enqueue complete requests. A finite `GetQueuedCompletionStatus` wait lets idle workers observe shutdown after the registry drains.
+- **Inference workers** (`IOCP_ONNX_INFERENCE_WORKERS`, default 4) wait on a condition variable, claim jobs in FIFO order, run inference outside the registry lock, and prepare a response. Completion order across different connections may vary.
 
-Because inference happens on the worker thread that dequeued the completion, ONNX Runtime's intra-op parallelism is deliberately set to 1 (`SetIntraOpNumThreads(1)`) — parallelism comes from concurrent requests across workers rather than from parallelizing a single inference.
+The CPU model uses one loaded session with intra-op parallelism set to 1. Each call uses its own tensors and input and output storage. All workers share the fixed session and read-only model metadata. ONNX Runtime supports concurrent `Run()` calls on this session. [ONNX Runtime architecture](https://onnxruntime.ai/docs/reference/high-level-design.html)
 
 ### Ownership invariants
 
 - The connection registry uniquely owns each admitted connection. The completion key is a borrowed `Connection*`; the registry keeps it and its two I/O contexts alive while a completion can still refer to them.
 - Each entry reserves at most one pending operation. The registry lock serializes posting, socket closure, and completion accounting. An immediate posting failure clears the reservation because Winsock will issue no packet for that attempt.
-- A worker claims a dequeued completion under the lock and holds exclusive access to the connection's protocol state until it posts the next operation or retires the entry. Shutdown can close that socket while the handler runs, including during inference. The registry holds the connection until that handler returns.
+- An IOCP worker claims a dequeued completion under the lock and gains exclusive access to protocol state. It either posts the next operation, retires the connection, or transfers ownership of protocol access to the scheduler. A queued or running job has no overlapping socket operation.
+- Every queue node owns its input vector and borrows the registry's connection pointer. The registry lock serializes enqueue, FIFO claim, and cancellation. A queued connection can retire only after its node has been removed. A running entry remains registered until its worker returns, even if the socket closes. Closure touches only socket state while the worker owns the protocol buffers.
+- When a model call returns, the worker prepares the response outside the lock, then reacquires the lock to verify that the server and socket are still open before posting. A closing worker retires the entry instead. The registry holds each buffer through the completion of its posted operation.
 - The listener belongs to the accept thread while it runs. The lifecycle mutex serializes `Start()` and `Stop()`, and socket and port teardown follow the thread joins.
 - Admission checks registry capacity under the same lock that inserts and reserves the initial receive. Excess sockets close before connection buffers or IOCP state are allocated. Pending cancellations and active handlers count against the limit until their entries retire.
 - The accept thread checks pending deadlines under the registry lock. Timeout closes the socket and retains its entry, buffer, and `OVERLAPPED` until the matching packet is accounted for. A completion for a closed socket retires the entry. Posting, timeout closure, and shutdown closure share the same lock.
+
+### Queue admission and disconnects
+
+Only validated complete frames enter the FIFO. `IOCP_ONNX_INFERENCE_QUEUE_CAPACITY` (default 64) counts waiting jobs. At most the configured number of workers can hold running jobs in addition to the waiting jobs. Each job holds one model-sized input. A full queue closes the submitting connection with the existing transport-level failure behavior and produces an `inference_rejected` event when connection tracing is enabled. It leaves admitted jobs in place.
+
+Winsock records `FD_CLOSE` on each socket. The existing registry sweep checks that record for queued or running connections, and inference workers check it at claim and before posting a reply. An observed abort before claim removes the job without running inference and frees its slot. An observed abort after claim closes the socket and lets the running call finish without posting a reply. Peer notification and claim can race. A graceful FIN leaves replies enabled so a client that half-closes its write side can still read its responses. TCP cannot distinguish an orderly client close from a half-close at that point. [Winsock `FD_CLOSE` semantics](https://learn.microsoft.com/en-us/windows/win32/api/winsock2/nf-winsock2-wsaeventselect)
 
 ### Network deadlines
 
@@ -40,14 +49,14 @@ Because inference happens on the worker thread that dequeued the completion, ONN
 - **Incomplete frame.** The first completion that exposes an incomplete header or payload starts an absolute frame budget. Subsequent fragments keep the same deadline. A partial frame buffered behind a response starts its budget when the final write completion exposes it.
 - **Stalled send.** Each pending send has an idle budget. A positive short completion earns a fresh budget for the remaining suffix.
 
-Deadlines use `std::chrono::steady_clock`. Workers compare them at completion accounting, with equality treated as expiration. Time spent in a handler, including inference, has no pending-I/O timer. The existing accept wait also wakes for a registry scan at the configured interval, including during sustained acceptance. Quiet sockets can close up to one scan interval later, plus thread scheduling delay. Smaller intervals increase scan frequency. Each scan is bounded by the configured connection limit.
+Deadlines use `std::chrono::steady_clock`. Workers compare them at completion accounting, with equality treated as expiration. Queue wait and inference execution have no pending-I/O timer. The existing accept wait also wakes for a registry scan at the configured interval, including during sustained acceptance. Quiet sockets can close up to one scan interval later, plus thread scheduling delay. Smaller intervals increase scan frequency. Each scan is bounded by the configured connection limit.
 
 ### Shutdown sequence
 
-1. Publish the stop request under the registry lock. From that point admission and new I/O are closed.
+1. Publish the stop request and cancel all waiting jobs under the registry lock. Wake inference workers. Admission, new job claims, and new socket I/O are closed.
 2. Join the accept thread and close the listener. Both the readiness wait and accept call have bounded waits.
-3. Close all active sockets to initiate cancellation. Workers account for successful, failed, and canceled completions, and return any entries they hold while processing.
-4. Wait for the registry to empty. Idle workers then exit, and the lifecycle caller joins them before closing the completion port and releasing its Winsock reference.
+3. Close all active sockets to initiate cancellation. IOCP workers drain completions. Running inference workers return their registry entries when their calls finish.
+4. Wait for the registry to empty. Join both pools, then close the peer event and completion port and release the server's Winsock reference.
 
 Partial startup failures unwind through the same teardown. Repeated and concurrent `Stop()` calls serialize through the lifecycle mutex. Shutdown closes inference clients promptly and waits for any inference already in progress to return.
 
@@ -59,7 +68,8 @@ Read completion → append received bytes → inspect buffered stream
 Final write completion ─────────────────→ inspect buffered stream
 
 Inspect buffered stream
-  complete frame → run inference → post WSASend
+  complete frame → enqueue → claim → run inference → post WSASend
+  full inference queue → retire the submitting connection
   incomplete frame → post WSARecv
   invalid prefix → retire registry entry
 
@@ -82,8 +92,8 @@ Key points:
 The wire protocol ([PROTOCOL.md](PROTOCOL.md)) is a length-prefixed float array. A request may arrive fragmented across many completions, and a completion can contain bytes from more than one request. The per-connection framer processes one request at a time.
 
 1. **Header.** Wait for eight bytes in the read buffer and decode the little-endian `uint64` count. Close the connection if it differs from the validated model input count.
-2. **Payload.** Accumulate fragments up to the model's input payload size. Once complete, assemble the `std::vector<float>`, run inference, and post the response. Retain trailing bytes by advancing the read cursor.
-3. **Response.** Finish the pending response before inspecting the retained bytes. A complete buffered request starts its response immediately. An incomplete frame re-arms the receive. A malformed subsequent prefix closes the connection.
+2. **Payload.** Accumulate fragments up to the model's input payload size. Move the assembled `std::vector<float>` to the queue when the frame completes. Retain trailing bytes by advancing the read cursor.
+3. **Response.** Finish the pending response before inspecting the retained bytes. A complete buffered request is offered to the queue immediately. An incomplete frame re-arms the receive. A malformed subsequent prefix closes the connection.
 
 Each completion advances at most one request. The registry still owns the connection until its pending I/O or active handler is accounted for during disconnect and shutdown.
 
@@ -118,7 +128,7 @@ performs no telemetry allocation.
 - `connections_active` is the registry size, including connections with a handler in progress or a closed socket awaiting a completion. `connections_high_watermark` is the maximum size reached on insertion.
 - `pending_io_operations` counts successful overlapped posts whose matching IOCP packets have yet to be accounted for. A matched packet decrements the gauge for success, failure, EOF, and cancellation. An immediate posting failure leaves it unchanged.
 - `idle_timeouts_total`, `incomplete_frame_timeouts_total`, and `send_timeouts_total` count expiration by phase. They increment when a scan closes an open socket, when a successful completion with positive bytes is rejected as expired, or when an expired frame budget prevents another receive from being posted.
-- `io_failures_total` counts runtime listener readiness failures, accept failures other than would-block and pre-admission peer resets, socket association and synchronous post failures, and non-cancellation IOCP errors. An unmatched packet or an unexpected dequeue failure also counts once. Readiness and dequeue timeouts, successful zero-byte completions, protocol rejection, and startup errors leave this counter unchanged.
+- `io_failures_total` counts runtime listener readiness failures, accept failures other than would-block and pre-admission peer resets, socket association and synchronous post failures, non-cancellation IOCP errors, and socket errors observed during queued or running inference. An unmatched packet or an unexpected dequeue failure also counts once. Readiness and dequeue timeouts, successful zero-byte completions, protocol or queue-capacity rejection, and startup errors leave this counter unchanged.
 - `cancellation_requests_total` increments when timeout or shutdown closes an open socket with a pending operation. `cancellation_completions_total` increments only when a matched IOCP packet reports `ERROR_OPERATION_ABORTED`. The request can also drain as success or another error, and an aborted completion can occur independently of a server close request.
 
 Cumulative counters are unsigned 64-bit values that saturate. They and the
@@ -148,6 +158,6 @@ The intent is lightweight **model/data drift detection** without external depend
 
 Deliberate simplifications to keep the codebase compact. Roughly in order of importance if the server were to face untrusted traffic:
 
-1. **Shutdown waits for current inference.** Socket closure cancels network I/O. A running model call must return before its worker can exit.
+1. **Shutdown waits for current inference.** Socket closure cancels network I/O. A claimed model call must return before its worker can exit. In-process code cannot guarantee an execution deadline for a hung model or provider. A hard deadline requires a separate inference process whose termination cannot invalidate the server's state.
 2. **Fixed listener and model settings.** Address, port, model path, and worker count are compiled in.
 3. **Single model, single node, `float32` only.** Dynamic dimensions are pinned to 1.
